@@ -1,0 +1,80 @@
+/* ---------- Page layout ---------- */
+html, body, #map {
+    height: 100%;
+    margin: 0;
+  }
+  
+  .hud {
+    position: absolute;
+    z-index: 1000;
+    top: 12px;
+    left: 12px;
+    background: rgba(255,255,255,0.95);
+    padding: 10px 12px;
+    border-radius: 10px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.15);
+    font: 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    min-width: 220px;
+  }
+  
+  .hud strong {
+    display: block;
+    margin-bottom: 6px;
+  }
+  
+  .muted {
+    color: #555;
+    font-size: 12px;
+  }
+  
+  /* ---------- Shuttle marker UI ---------- */
+  .shuttle-marker{
+    position: relative;
+    width: 34px;
+    height: 34px;
+  }
+  
+  .shuttle-badge{
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background: var(--routeColor);
+    display: grid;
+    place-items: center;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.25);
+    border: 2px solid rgba(255,255,255,0.9);
+  }
+  
+  .shuttle-arrow-wrap{
+    position: absolute;
+    inset: 0;
+    transform: rotate(var(--bearing));
+  }
+  
+  .shuttle-arrow{
+    position: absolute;
+    top: -4px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 0;
+    height: 0;
+    border-left: 7px solid transparent;
+    border-right: 7px solid transparent;
+    border-bottom: 11px solid var(--routeColor);
+    filter: drop-shadow(0 2px 2px rgba(0,0,0,0.25));
+  }
+  
+  #follow-btn {
+    background: white;
+    border: 1px solid rgba(0,0,0,0.08);
+    padding: 6px 10px;
+    font-size: 14px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  #follow-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  
+  
