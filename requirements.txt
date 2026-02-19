@@ -1,3 +1,0 @@
-flask
-requests
-gtfs-realtime-bindings
