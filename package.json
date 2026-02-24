@@ -1,0 +1,23 @@
+{
+  "name": "passiogo_v1",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"cd backend && python app.py\" \"cd frontend && npm run dev\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/christinaw123/PassioGo.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/christinaw123/PassioGo/issues"
+  },
+  "homepage": "https://github.com/christinaw123/PassioGo#readme",
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

@@ -9,7 +9,7 @@ GTFS_DIR = os.path.join(BASE_DIR, "data", "google_transit")
 route_lookup_by_name: Dict[str, Dict[str, str]] = {}
 trips_grouped_by_route_id: Dict[str, List[Dict[str, str]]] = {}
 route_id_by_trip_id: Dict[str, str] = {}
-stop_row_by_stop_id: Dict[str, Dict[str, str]] = {}
+stop_row_by_stop_id: Dict[str, Dict[str, Any]] = {}
 shape_points_by_shape_id: Dict[str, List[Dict[str, str]]] = {}
 stop_times_by_trip_id: Dict[str, List[Dict[str, str]]] = {}
 
