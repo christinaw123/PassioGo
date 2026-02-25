@@ -10,9 +10,12 @@ import { motion } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
   nearestPointOnLine,
+  nearestPointOnLineInRange,
   clipLineSegment,
   lineLength,
   haversineDistance,
+  buildPrecomputedRoute,
+  type PrecomputedRoute,
 } from "../../utils/geo";
 
 interface RouteInfo {
@@ -50,78 +53,137 @@ interface ShuttleOption {
   vehicles: Vehicle[];
   busState: BusState;
   routeCoords: [number, number][];
+  /** Precomputed stop projections — built once at load time, reused every poll */
+  precomputed: PrecomputedRoute | null;
 }
 
 /** ~12 mph average shuttle speed in m/s */
 const AVG_SPEED_MPS = 5.4;
-const DWELL_DISTANCE_M = 100;
+const DWELL_DISTANCE_M = 50;
 const BLEND_MIN_SPEED_MPS = 1.0;
 const MAX_OFF_ROUTE_M = 500;
 
 function detectBusState(
   vehicles: Vehicle[],
-  originStop: { lat: number; lon: number },
-  routeCoords: [number, number][]
+  originStop: { id: string; lat: number; lon: number },
+  routeCoords: [number, number][],
+  precomputed?: PrecomputedRoute
 ): Omit<BusState, "leavingInMinutes" | "departureDisplay" | "nextDepartures"> & { nextDepartures?: NextDeparture[] } {
-  if (vehicles.length === 0) {
-    return { type: "no-data", nextDepartures: [] };
-  }
+  if (vehicles.length === 0) return { type: "no-data", nextDepartures: [] };
 
   const originLngLat: [number, number] = [originStop.lon, originStop.lat];
 
-  // Check if any vehicle is dwelling (within DWELL_DISTANCE_M of origin stop)
+  // Dwell check — prefer stop_id match (more accurate than haversine alone)
   for (const v of vehicles) {
     const dist = haversineDistance([v.lon, v.lat], originLngLat);
-    if (dist <= DWELL_DISTANCE_M) {
-      return { type: "dwelling", vehicle: v };
-    }
+    const isDwelling =
+      (v.stop_id != null && v.stop_id === originStop.id && dist <= 100) ||
+      dist <= DWELL_DISTANCE_M;
+    if (isDwelling) return { type: "dwelling", vehicle: v };
   }
 
-  // Find nearest vehicle approaching the origin stop along the route
-  if (routeCoords.length >= 2) {
-    const originProj = nearestPointOnLine(routeCoords, originLngLat);
+  if (routeCoords.length < 2) return { type: "departed", nextDepartures: [] };
 
-    let bestEta = Infinity;
-    let bestVehicle: Vehicle | null = null;
-    let bestTrail: [number, number][] = [];
+  type StopProj = { segIndex: number; projPoint: [number, number]; t: number };
+  const stopProjs: StopProj[] | null = precomputed?.stopProjs ?? null;
+  const stopPositions: [number, number][] | null = precomputed?.stopPositions ?? null;
+  const originIdx: number = precomputed?.originIdx ?? -1;
+  const isLoop: boolean = precomputed?.isLoop ??
+    (routeCoords.length >= 10 &&
+      haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100);
 
-    for (const v of vehicles) {
-      const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
-      // Skip vehicles too far from the route shape (deadheading / stale trip_id)
-      if (vProj.dist > MAX_OFF_ROUTE_M) continue;
-      // Only consider vehicles that haven't passed origin yet
-      if (
+  const originProj: StopProj =
+    stopProjs && originIdx >= 0
+      ? stopProjs[originIdx]
+      : nearestPointOnLine(routeCoords, originLngLat);
+
+  const projectVehicle = (v: Vehicle): { vProj: ReturnType<typeof nearestPointOnLine>; nearestStopIdx: number } => {
+    if (stopProjs && stopPositions) {
+      let nearestStopIdx = 0;
+      let nearestDist = Infinity;
+      for (let i = 0; i < stopPositions.length; i++) {
+        const d = haversineDistance([v.lon, v.lat], stopPositions[i]);
+        if (d < nearestDist) { nearestDist = d; nearestStopIdx = i; }
+      }
+      const lo = stopProjs[Math.max(0, nearestStopIdx - 1)].segIndex;
+      const hi = stopProjs[Math.min(stopProjs.length - 1, nearestStopIdx + 1)].segIndex;
+      return { vProj: nearestPointOnLineInRange(routeCoords, [v.lon, v.lat], lo, hi), nearestStopIdx };
+    }
+    return { vProj: nearestPointOnLine(routeCoords, [v.lon, v.lat]), nearestStopIdx: -1 };
+  };
+
+  let bestEta = Infinity;
+  let bestVehicle: Vehicle | null = null;
+  let bestTrail: [number, number][] = [];
+
+  for (const v of vehicles) {
+    const { vProj, nearestStopIdx } = projectVehicle(v);
+    if (vProj.dist > MAX_OFF_ROUTE_M) continue;
+
+    let isApproaching: boolean;
+    if (stopProjs && stopPositions && originIdx >= 0 && nearestStopIdx >= 0) {
+      const N = stopPositions.length;
+      const forwardStopDist = isLoop
+        ? (originIdx - nearestStopIdx + N) % N
+        : originIdx - nearestStopIdx;
+      isApproaching = forwardStopDist > 0 && (isLoop ? forwardStopDist <= N / 2 : true);
+    } else {
+      isApproaching = !(
         vProj.segIndex > originProj.segIndex ||
         (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
-      ) {
-        continue;
-      }
+      );
+    }
 
-      const trail = clipLineSegment(
+    if (!isApproaching) continue;
+
+    let trail: [number, number][];
+    if (
+      vProj.segIndex < originProj.segIndex ||
+      (vProj.segIndex === originProj.segIndex && vProj.t <= originProj.t)
+    ) {
+      trail = clipLineSegment(
         routeCoords,
         vProj.segIndex,
         vProj.projPoint,
         originProj.segIndex,
         originProj.projPoint
       );
-      if (trail.length < 2) continue;
-
-      const dist = lineLength(trail);
-      const speed = (v.speed ?? 0) > BLEND_MIN_SPEED_MPS ? v.speed! : AVG_SPEED_MPS;
-      const eta = Math.max(1, Math.round(dist / speed / 60));
-
-      if (eta < bestEta) {
-        bestEta = eta;
-        bestVehicle = v;
-        bestTrail = trail;
-      }
+    } else if (isLoop) {
+      const toEnd = clipLineSegment(
+        routeCoords,
+        vProj.segIndex,
+        vProj.projPoint,
+        routeCoords.length - 2,
+        routeCoords[routeCoords.length - 1]
+      );
+      const fromStart = clipLineSegment(
+        routeCoords,
+        0,
+        routeCoords[0],
+        originProj.segIndex,
+        originProj.projPoint
+      );
+      trail = [...toEnd, ...fromStart];
+    } else {
+      trail = [];
     }
 
-    if (bestVehicle) {
-      return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
+    if (trail.length < 2) continue;
+
+    const dist = lineLength(trail);
+    const speed = (v.speed ?? 0) > BLEND_MIN_SPEED_MPS ? v.speed! : AVG_SPEED_MPS;
+    const eta = Math.max(1, Math.round(dist / speed / 60));
+
+    if (eta < bestEta) {
+      bestEta = eta;
+      bestVehicle = v;
+      bestTrail = trail;
     }
   }
 
+  if (bestVehicle) {
+    return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
+  }
   return { type: "departed", nextDepartures: [] };
 }
 
@@ -250,9 +312,15 @@ export function ShuttleSelectionScreen() {
 
             const vehicles: Vehicle[] = vehiclesData.vehicles || [];
 
+            // Build precomputed route data once — reused on every poll to avoid
+            // re-projecting all stops inside detectBusState each time.
+            const precomputed = oStop
+              ? buildPrecomputedRoute(routeCoords, route.stops, [oStop.lon, oStop.lat])
+              : null;
+
             let busState: BusState;
             if (oStop) {
-              const raw = detectBusState(vehicles, oStop, routeCoords);
+              const raw = detectBusState(vehicles, oStop, routeCoords, precomputed ?? undefined);
               if (raw.type === "dwelling") {
                 const dwellingVehicle = (raw as { vehicle: Vehicle }).vehicle;
                 const depUnix = await fetchScheduledDeparture(dwellingVehicle.trip_id, oStop.id);
@@ -270,7 +338,7 @@ export function ShuttleSelectionScreen() {
               busState = { type: "no-data", nextDepartures: [] };
             }
 
-            return { route, vehicles, busState, routeCoords };
+            return { route, vehicles, busState, routeCoords, precomputed };
           })
         );
 
@@ -346,7 +414,7 @@ export function ShuttleSelectionScreen() {
 
             if (!routeOStop) return { ...opt, vehicles: freshVehicles };
 
-            const raw = detectBusState(freshVehicles, routeOStop, opt.routeCoords);
+            const raw = detectBusState(freshVehicles, routeOStop, opt.routeCoords, opt.precomputed ?? undefined);
             let busState: BusState;
 
             if (raw.type === "dwelling") {

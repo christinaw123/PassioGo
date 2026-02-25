@@ -10,9 +10,12 @@ import { motion, AnimatePresence } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
   nearestPointOnLine,
+  nearestPointOnLineInRange,
   clipLineSegment,
   lineLength,
   haversineDistance,
+  buildPrecomputedRoute,
+  type PrecomputedRoute,
 } from "../../utils/geo";
 
 interface Vehicle {
@@ -23,6 +26,7 @@ interface Vehicle {
   bearing: number | null;
   speed: number | null;
   current_stop_sequence: number | null;
+  stop_id: string | null;
 }
 
 interface TimelineStop {
@@ -49,7 +53,9 @@ type BusState =
   | { type: "no-data"; nextDepartures: NextDeparture[] };
 
 const AVG_SPEED_MPS = 5.4;
-const DWELL_DISTANCE_M = 100;
+/** Tight haversine fallback for dwell (when no stop_id available). 50 m keeps
+ *  "at stop now" from firing for a bus parked on the other side of a building. */
+const DWELL_DISTANCE_M = 50;
 const BLEND_MIN_SPEED_MPS = 1.0;
 /** Show vehicle icon up to this many meters past origin before hiding it */
 const DEPARTED_SHOW_DISTANCE_M = 500;
@@ -59,49 +65,130 @@ const MAX_OFF_ROUTE_M = 500;
 
 function detectBusState(
   vehicles: Vehicle[],
-  originStop: { lat: number; lon: number },
-  routeCoords: [number, number][]
+  originStop: { id: string; lat: number; lon: number },
+  routeCoords: [number, number][],
+  precomputed?: PrecomputedRoute
 ): BusState {
-  if (vehicles.length === 0) {
-    return { type: "no-data", nextDepartures: [] };
-  }
+  if (vehicles.length === 0) return { type: "no-data", nextDepartures: [] };
 
   const originLngLat: [number, number] = [originStop.lon, originStop.lat];
 
-  // Check if any vehicle is dwelling
+  // Dwell check.
+  // Primary signal: vehicle's GTFS-RT stop_id matches this stop AND is physically close.
+  // This is more reliable than haversine alone since stop_id is set by the vehicle's own
+  // onboard system. Fallback: tight haversine (50 m) when stop_id is unavailable.
   for (const v of vehicles) {
     const dist = haversineDistance([v.lon, v.lat], originLngLat);
-    if (dist <= DWELL_DISTANCE_M) {
-      return { type: "dwelling", vehicle: v, leavingInMinutes: null };
-    }
+    const isDwelling =
+      (v.stop_id != null && v.stop_id === originStop.id && dist <= 100) ||
+      dist <= DWELL_DISTANCE_M;
+    if (isDwelling) return { type: "dwelling", vehicle: v, leavingInMinutes: null };
   }
 
-  if (routeCoords.length >= 2) {
-    const originProj = nearestPointOnLine(routeCoords, originLngLat);
+  if (routeCoords.length < 2) return { type: "departed", vehicle: null, nextDepartures: [] };
 
-    let bestEta = Infinity;
-    let bestVehicle: Vehicle | null = null;
-    let bestTrail: [number, number][] = [];
+  // Use precomputed projections if available (computed once when route loads, not per-poll).
+  // Fall back to inline computation if not provided.
+  type StopProj = { segIndex: number; projPoint: [number, number]; t: number };
+  let stopProjs: StopProj[] | null = precomputed?.stopProjs ?? null;
+  let originIdx: number = precomputed?.originIdx ?? -1;
+  const isLoop: boolean = precomputed?.isLoop ??
+    (routeCoords.length >= 10 &&
+      haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100);
 
-    // Check for vehicles approaching (before origin)
-    for (const v of vehicles) {
-      const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
-      // Skip vehicles too far from the route shape (deadheading / stale trip_id)
-      if (vProj.dist > MAX_OFF_ROUTE_M) continue;
-      if (
+  // Origin projection — use stop-based if available (avoids wrong loop snap)
+  const originProj: StopProj =
+    stopProjs && originIdx >= 0
+      ? stopProjs[originIdx]
+      : nearestPointOnLine(routeCoords, originLngLat);
+
+  // Project a vehicle onto the shape, constrained to its nearest stop's bracket.
+  // stopPositions (parallel to stopProjs) are used for the haversine nearest-stop lookup.
+  // This prevents nearestPointOnLine from snapping to the wrong iteration on loop routes.
+  const stopPositions = precomputed?.stopPositions ?? null;
+  const projectVehicle = (
+    v: Vehicle
+  ): { vProj: ReturnType<typeof nearestPointOnLine>; nearestStopIdx: number } => {
+    if (stopProjs && stopPositions) {
+      let nearestStopIdx = 0;
+      let nearestDist = Infinity;
+      for (let i = 0; i < stopPositions.length; i++) {
+        const d = haversineDistance([v.lon, v.lat], stopPositions[i]);
+        if (d < nearestDist) { nearestDist = d; nearestStopIdx = i; }
+      }
+      const lo = stopProjs[Math.max(0, nearestStopIdx - 1)].segIndex;
+      const hi = stopProjs[Math.min(stopProjs.length - 1, nearestStopIdx + 1)].segIndex;
+      return { vProj: nearestPointOnLineInRange(routeCoords, [v.lon, v.lat], lo, hi), nearestStopIdx };
+    }
+    return { vProj: nearestPointOnLine(routeCoords, [v.lon, v.lat]), nearestStopIdx: -1 };
+  };
+
+  let bestEta = Infinity;
+  let bestVehicle: Vehicle | null = null;
+  let bestTrail: [number, number][] = [];
+  let closestPastVehicle: Vehicle | null = null;
+  let closestPastDist = Infinity;
+
+  for (const v of vehicles) {
+    const { vProj, nearestStopIdx } = projectVehicle(v);
+    if (vProj.dist > MAX_OFF_ROUTE_M) continue;
+
+    // Determine approaching vs past using stop-sequence order (handles loops correctly).
+    // For loops, use circular modular distance: if the vehicle is within half the loop
+    // behind origin in stop order, it is approaching.
+    let isApproaching: boolean;
+    if (stopProjs && stopPositions && originIdx >= 0 && nearestStopIdx >= 0) {
+      const N = stopPositions.length;
+      const forwardStopDist = isLoop
+        ? (originIdx - nearestStopIdx + N) % N
+        : originIdx - nearestStopIdx;
+      isApproaching = forwardStopDist > 0 && (isLoop ? forwardStopDist <= N / 2 : true);
+    } else {
+      isApproaching = !(
         vProj.segIndex > originProj.segIndex ||
         (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
+      );
+    }
+
+    if (isApproaching) {
+      // Build trail from vehicle to origin along the shape.
+      // For loop routes, if the vehicle is near the end of the shape and origin is near the
+      // start, stitch two segments together across the loop boundary.
+      let trail: [number, number][];
+      if (
+        vProj.segIndex < originProj.segIndex ||
+        (vProj.segIndex === originProj.segIndex && vProj.t <= originProj.t)
       ) {
-        continue;
+        // Normal case: vehicle appears before origin in shape order
+        trail = clipLineSegment(
+          routeCoords,
+          vProj.segIndex,
+          vProj.projPoint,
+          originProj.segIndex,
+          originProj.projPoint
+        );
+      } else if (isLoop) {
+        // Loop wrap-around: vehicle is near end of shape, origin near start.
+        // Stitch: vehicle→shape_end + shape_start→origin
+        const toEnd = clipLineSegment(
+          routeCoords,
+          vProj.segIndex,
+          vProj.projPoint,
+          routeCoords.length - 2,
+          routeCoords[routeCoords.length - 1]
+        );
+        const fromStart = clipLineSegment(
+          routeCoords,
+          0,
+          routeCoords[0],
+          originProj.segIndex,
+          originProj.projPoint
+        );
+        trail = [...toEnd, ...fromStart];
+      } else {
+        trail = [];
       }
 
-      const trail = clipLineSegment(
-        routeCoords,
-        vProj.segIndex,
-        vProj.projPoint,
-        originProj.segIndex,
-        originProj.projPoint
-      );
       if (trail.length < 2) continue;
 
       const dist = lineLength(trail);
@@ -113,34 +200,19 @@ function detectBusState(
         bestVehicle = v;
         bestTrail = trail;
       }
-    }
-
-    if (bestVehicle) {
-      return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
-    }
-
-    // All vehicles are past the origin — find the most recently departed one
-    // (closest to origin along route, but past it)
-    let closestPastVehicle: Vehicle | null = null;
-    let closestPastDist = Infinity;
-
-    for (const v of vehicles) {
+    } else {
       const dist = haversineDistance([v.lon, v.lat], originLngLat);
-      const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
-      if (vProj.dist > MAX_OFF_ROUTE_M) continue;
-      const isPast =
-        vProj.segIndex > originProj.segIndex ||
-        (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t);
-      if (isPast && dist < closestPastDist) {
+      if (dist < closestPastDist) {
         closestPastDist = dist;
         closestPastVehicle = v;
       }
     }
-
-    return { type: "departed", vehicle: closestPastVehicle, nextDepartures: [] };
   }
 
-  return { type: "departed", vehicle: null, nextDepartures: [] };
+  if (bestVehicle) {
+    return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
+  }
+  return { type: "departed", vehicle: closestPastVehicle, nextDepartures: [] };
 }
 
 export function TrackingPreBoardScreen() {
@@ -156,6 +228,7 @@ export function TrackingPreBoardScreen() {
 
   const [busState, setBusState] = useState<BusState | null>(null);
   const [routeCoords, setRouteCoords] = useState<[number, number][]>([]);
+  const [routeStops, setRouteStops] = useState<{ lat: number; lon: number }[]>([]);
   const [originStop, setOriginStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
   const [destStop, setDestStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
   const [timeline, setTimeline] = useState<TimelineStop[]>([]);
@@ -226,6 +299,7 @@ export function TrackingPreBoardScreen() {
           }
         } catch { /* no geojson */ }
         setRouteCoords(coords);
+        setRouteStops(stops.map((s: { lat: number; lon: number }) => ({ lat: s.lat, lon: s.lon })));
 
         const oStop = stops.find(
           (s: { name: string; id: string; lat: number; lon: number }) =>
@@ -245,7 +319,14 @@ export function TrackingPreBoardScreen() {
 
         let state: BusState;
         if (oStop) {
-          const raw = detectBusState(vehicles, oStop, coords);
+          // Compute precomputed data inline here since useMemo hasn't re-run yet
+          // (state setters above haven't triggered a re-render).
+          const initPrecomputed = buildPrecomputedRoute(
+            coords,
+            stops.map((s: { lat: number; lon: number }) => ({ lat: s.lat, lon: s.lon })),
+            [oStop.lon, oStop.lat]
+          );
+          const raw = detectBusState(vehicles, oStop, coords, initPrecomputed ?? undefined);
           if (raw.type === "dwelling") {
             const depUnix = await fetchScheduledDeparture(raw.vehicle.trip_id, oStop.id);
             const leavingIn = depUnix != null
@@ -311,9 +392,18 @@ export function TrackingPreBoardScreen() {
     });
   }, [mapInstance, originStop, destStop]);
 
+  // Precompute stop-to-shape projections ONCE when route data loads.
+  // This avoids re-projecting all stops inside detectBusState on every 5-second poll.
+  const precomputedRoute = useMemo<PrecomputedRoute | null>(() => {
+    if (!originStop || routeCoords.length < 2 || routeStops.length < 2) return null;
+    return buildPrecomputedRoute(routeCoords, routeStops, [originStop.lon, originStop.lat]);
+  }, [routeCoords, routeStops, originStop]);
+
   // Keep refs for polling
   const routeCoordsRef = useRef(routeCoords);
-  routeCoordsRef.current = routeCoords;
+  routeCoordsRef.current = routeCoords;  // needed for fitBounds effect
+  const precomputedRef = useRef(precomputedRoute);
+  precomputedRef.current = precomputedRoute;
   const originStopRef = useRef(originStop);
   originStopRef.current = originStop;
 
@@ -331,7 +421,7 @@ export function TrackingPreBoardScreen() {
         const oStop = originStopRef.current;
         if (!oStop) return;
 
-        const raw = detectBusState(vehicles, oStop, coords);
+        const raw = detectBusState(vehicles, oStop, coords, precomputedRef.current ?? undefined);
         let state: BusState;
 
         if (raw.type === "dwelling") {

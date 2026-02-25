@@ -72,6 +72,83 @@ export function clipLineSegment(
   return result;
 }
 
+/** Static per-route data computed once from route shape + stop list.
+ *  Pass this to detectBusState instead of re-projecting on every vehicle poll. */
+export interface PrecomputedRoute {
+  /** Shape projection for each stop, in route order */
+  stopProjs: { segIndex: number; projPoint: [number, number]; t: number }[];
+  /** [lng, lat] position of each stop, parallel to stopProjs — used for
+   *  haversine nearest-stop lookups without re-accessing the original stop array */
+  stopPositions: [number, number][];
+  /** Index into stopProjs of the user's origin stop */
+  originIdx: number;
+  /** True if the shape forms a closed loop (start ≈ end within 100 m) */
+  isLoop: boolean;
+}
+
+/** Compute static route projection data once when route data loads.
+ *  orderedStops must be in trip-stop-sequence order.
+ *  originLngLat is the [lng, lat] of the user's origin stop. */
+export function buildPrecomputedRoute(
+  routeCoords: [number, number][],
+  orderedStops: { lat: number; lon: number }[],
+  originLngLat: [number, number]
+): PrecomputedRoute | null {
+  if (routeCoords.length < 2 || orderedStops.length < 2) return null;
+
+  const stopPositions: [number, number][] = orderedStops.map((s) => [s.lon, s.lat]);
+  const stopProjs = stopPositions.map((lngLat) => {
+    const p = nearestPointOnLine(routeCoords, lngLat);
+    return { segIndex: p.segIndex, projPoint: p.projPoint, t: p.t };
+  });
+
+  let originIdx = -1;
+  let minD = Infinity;
+  for (let i = 0; i < orderedStops.length; i++) {
+    const d = haversineDistance(
+      [orderedStops[i].lon, orderedStops[i].lat],
+      originLngLat
+    );
+    if (d < minD) { minD = d; originIdx = i; }
+  }
+
+  const isLoop =
+    routeCoords.length >= 10 &&
+    haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100;
+
+  return { stopProjs, stopPositions, originIdx, isLoop };
+}
+
+/** Like nearestPointOnLine but only searches segments [startSegIdx, endSegIdx] inclusive.
+ *  Used to constrain vehicle projection to a known bracket of the route shape, preventing
+ *  nearestPointOnLine from snapping to the wrong loop iteration on circular routes. */
+export function nearestPointOnLineInRange(
+  line: [number, number][],
+  point: [number, number],
+  startSegIdx: number,
+  endSegIdx: number
+): { segIndex: number; projPoint: [number, number]; dist: number; t: number } {
+  const lo = Math.max(0, startSegIdx);
+  const hi = Math.min(endSegIdx, line.length - 2);
+  let bestDist = Infinity;
+  let bestSeg = lo;
+  let bestPoint: [number, number] = line[lo] ?? line[0];
+  let bestT = 0;
+
+  for (let i = lo; i <= hi; i++) {
+    const { point: proj, t } = projectOnSegment(point, line[i], line[i + 1]);
+    const d = haversineDistance(point, proj);
+    if (d < bestDist) {
+      bestDist = d;
+      bestSeg = i;
+      bestPoint = proj;
+      bestT = t;
+    }
+  }
+
+  return { segIndex: bestSeg, projPoint: bestPoint, dist: bestDist, t: bestT };
+}
+
 /** Total length of a polyline in meters */
 export function lineLength(coords: [number, number][]): number {
   let total = 0;
