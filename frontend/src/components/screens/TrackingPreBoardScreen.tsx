@@ -527,7 +527,7 @@ export function TrackingPreBoardScreen() {
 
   if (loading) {
     return (
-      <div className="flex h-[100dvh] items-center justify-center bg-white">
+      <div className="flex h-full items-center justify-center bg-white">
         <div className="h-8 w-8 animate-spin rounded-full border-4 border-blue-200 border-t-blue-600" />
       </div>
     );
@@ -536,7 +536,7 @@ export function TrackingPreBoardScreen() {
   const isDeparted = busState?.type === "departed";
 
   return (
-    <div className="relative mx-auto h-[100dvh] w-full max-w-[430px] overflow-hidden bg-white">
+    <div className="relative mx-auto h-full w-full max-w-[430px] overflow-hidden bg-white">
       {/* Map */}
       <Map onMapReady={setMapInstance}>
         {(map) => (

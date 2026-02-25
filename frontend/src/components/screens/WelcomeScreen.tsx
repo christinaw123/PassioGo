@@ -184,7 +184,7 @@ export function WelcomeScreen() {
   };
 
   return (
-    <div className="relative mx-auto h-dvh w-full max-w-107.5 overflow-hidden bg-white">
+    <div className="relative mx-auto h-full w-full max-w-107.5 overflow-hidden bg-white">
       {/* Full-screen Mapbox map */}
       <Map onMapReady={setMapInstance}>
         {(map) => (

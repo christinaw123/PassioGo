@@ -532,7 +532,7 @@ export function ShuttleSelectionScreen() {
   };
 
   return (
-    <div className="relative mx-auto h-[100dvh] w-full max-w-[430px] overflow-hidden bg-white">
+    <div className="relative mx-auto h-full w-full max-w-[430px] overflow-hidden bg-white">
       {/* Map */}
       <Map onMapReady={setMapInstance}>
         {(map) => (

@@ -37,6 +37,169 @@ body,
   width: 100%;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   PHONE DEMO FRAME  — only active on desktop (min-width: 600 px)
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Mobile passthrough (default) ─────────────────────────── */
+.phone-shell    { width: 100%; height: 100%; position: relative; }
+.phone-btn      { display: none; }
+.phone-screen   { position: relative; width: 100%; height: 100%; overflow: hidden; }
+.phone-island   { display: none; }
+.phone-content  { position: relative; width: 100%; height: 100%; }
+.phone-home-bar { display: none; }
+
+/* ── Desktop phone mockup ──────────────────────────────────── */
+@media (min-width: 600px) {
+
+  /* Dark gradient backdrop */
+  html, body {
+    height: 100svh;
+    overflow: hidden;
+    background: linear-gradient(145deg, #0b0b18 0%, #12103a 45%, #0b0b18 100%);
+  }
+
+  /* #root is just a transparent passthrough */
+  #root {
+    height: auto !important;
+    width: auto !important;
+    overflow: visible !important;
+  }
+
+  /* ── Outer phone chassis ─────────────────────────────────── */
+  .phone-shell {
+    /* Fixed to viewport center — immune to flex safe-center overflow clipping */
+    position: fixed;
+    top: 50%;
+    left: 50%;
+
+    width: 418px;
+    height: 872px;              /* 14 px padding + 844 px screen + 14 px padding */
+
+    background: linear-gradient(160deg, #323232 0%, #1c1c1c 55%, #252525 100%);
+    border-radius: 52px;
+
+    /* Layered shadows: thin highlight ring → dark gap ring → depth shadow */
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.10),
+      0 0 0 3px #0e0e0e,
+      0 40px 100px rgba(0, 0, 0, 0.80),
+      0 10px 40px  rgba(0, 0, 0, 0.50);
+
+    /* Subtle top-edge reflection */
+    overflow: visible;
+
+    /* Center and scale to fit with 60 px top/bottom breathing room.
+       Dividing two lengths (px/px) produces a unitless number for scale(). */
+    transform: translate(-50%, -50%) scale(min(0.88, calc((100svh - 120px) / 872px)));
+    transform-origin: center center;
+  }
+
+  /* Top-edge gloss */
+  .phone-shell::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 52px;
+    background: linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0.07) 0%,
+      transparent 25%
+    );
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* ── Side buttons ────────────────────────────────────────── */
+  .phone-btn {
+    display: block;
+    position: absolute;
+    background: linear-gradient(to right, #181818, #282828);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
+  }
+
+  /* Silent / ringer toggle */
+  .phone-btn-silent {
+    left: -4px; top: 128px;
+    width: 4px; height: 30px;
+    border-radius: 3px 0 0 3px;
+  }
+
+  /* Volume up */
+  .phone-btn-vol-up {
+    left: -4px; top: 176px;
+    width: 4px; height: 62px;
+    border-radius: 3px 0 0 3px;
+  }
+
+  /* Volume down */
+  .phone-btn-vol-dn {
+    left: -4px; top: 254px;
+    width: 4px; height: 62px;
+    border-radius: 3px 0 0 3px;
+  }
+
+  /* Power / side button */
+  .phone-btn-power {
+    right: -4px; top: 204px;
+    width: 4px; height: 82px;
+    border-radius: 0 3px 3px 0;
+    background: linear-gradient(to left, #181818, #282828);
+  }
+
+  /* ── Screen bezel ────────────────────────────────────────── */
+  .phone-screen {
+    position: absolute;
+    top: 14px; left: 14px; right: 14px; bottom: 14px;
+    width: auto; height: auto;  /* override mobile-passthrough 100% so left+right constrain width */
+    /* Resolves to exactly 390 × 844 px */
+    border-radius: 40px;
+    overflow: hidden;
+    background: #ffffff;
+
+    /* Thin inner bevel */
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+  }
+
+  /* ── Dynamic Island ──────────────────────────────────────── */
+  .phone-island {
+    display: block;
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 126px;
+    height: 37px;
+    background: #000;
+    border-radius: 20px;
+    z-index: 1000;
+    pointer-events: none;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04);
+  }
+
+  /* ── Content area ────────────────────────────────────────── */
+  .phone-content {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* ── Home indicator ──────────────────────────────────────── */
+  .phone-home-bar {
+    display: block;
+    position: absolute;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 134px;
+    height: 5px;
+    background: rgba(0, 0, 0, 0.20);
+    border-radius: 3px;
+    z-index: 1000;
+    pointer-events: none;
+  }
+}
+
 @keyframes pulse {
   0% {
     transform: scale(1);

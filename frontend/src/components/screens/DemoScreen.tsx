@@ -16,7 +16,7 @@ export function DemoScreen() {
   }, []);
 
   return (
-    <div className="flex min-h-[100dvh] flex-col items-center justify-center bg-gray-950 px-6 text-center">
+    <div className="flex min-h-full flex-col items-center justify-center bg-gray-950 px-6 text-center">
       {/* Title */}
       <div className="mb-10">
         <h1 className="mb-2 text-3xl font-bold text-white">Harvard Shuttle</h1>
