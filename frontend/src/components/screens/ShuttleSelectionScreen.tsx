@@ -595,9 +595,7 @@ export function ShuttleSelectionScreen() {
       {/* Back button */}
       <button
         onClick={() =>
-          navigate("/", {
-            state: { origin, destination, returningFrom: "shuttle-selection" },
-          })
+          navigate("/")
         }
         className="absolute left-6 top-12 z-30 flex h-10 w-10 cursor-pointer items-center justify-center rounded-full bg-white shadow-lg transition-colors hover:bg-gray-50"
       >

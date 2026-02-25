@@ -5,7 +5,7 @@ import { StopMarker } from "../StopMarker";
 import { VehicleMarker } from "../VehicleMarker";
 import { RouteTrail } from "../RouteTrail";
 import { BottomSheet } from "../BottomSheet";
-import { Bus, ChevronLeft, Clock, List } from "lucide-react";
+import { Bus, ChevronLeft } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
@@ -27,17 +27,6 @@ interface Vehicle {
   speed: number | null;
   current_stop_sequence: number | null;
   stop_id: string | null;
-}
-
-interface TimelineStop {
-  stop_id: string;
-  stop_name: string;
-  lat: number;
-  lon: number;
-  stop_sequence: number;
-  scheduled_arrival: string | null;
-  predicted_arrival: number | null;
-  arrival_delay: number | null;
 }
 
 interface NextDeparture {
@@ -231,8 +220,6 @@ export function TrackingPreBoardScreen() {
   const [routeStops, setRouteStops] = useState<{ lat: number; lon: number }[]>([]);
   const [originStop, setOriginStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
   const [destStop, setDestStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
-  const [timeline, setTimeline] = useState<TimelineStop[]>([]);
-  const [showTimeline, setShowTimeline] = useState(false);
   const [mapInstance, setMapInstance] = useState<mapboxgl.Map | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -343,25 +330,6 @@ export function TrackingPreBoardScreen() {
           state = { type: "no-data", nextDepartures: [] };
         }
         setBusState(state);
-
-        // Load timeline for approaching vehicle
-        const trackingVehicle =
-          state.type === "arriving" ? state.vehicle :
-          state.type === "dwelling" ? state.vehicle :
-          (state.type === "departed" ? state.vehicle : null);
-
-        if (trackingVehicle?.trip_id) {
-          try {
-            const tlRes = await fetch(
-              `/api/trip-timeline?trip_id=${encodeURIComponent(trackingVehicle.trip_id)}`,
-              { signal }
-            );
-            if (tlRes.ok) {
-              const tlData = await tlRes.json();
-              setTimeline(tlData.stops || []);
-            }
-          } catch { /* timeline unavailable */ }
-        }
       } catch (e) {
         if (e instanceof Error && e.name !== "AbortError") {
           console.error("Failed to load tracking data:", e);
@@ -467,63 +435,6 @@ export function TrackingPreBoardScreen() {
     if (busState.type === "departed" && showDepartedVehicle) return busState.vehicle;
     return null;
   }, [busState, showDepartedVehicle]);
-
-  // Filter timeline — clip at destination first, then find the closest stop to the
-  // vehicle within that range. Computing destIdx first prevents closestIdx from
-  // landing on a stop past the destination (which would make the slice empty).
-  const visibleTimeline = useMemo(() => {
-    if (timeline.length === 0 || !activeVehicle) return timeline;
-    const destIdx = timeline.findIndex(
-      (s) =>
-        s.stop_name.toLowerCase().includes(destination.toLowerCase()) ||
-        destination.toLowerCase().includes(s.stop_name.toLowerCase())
-    );
-    const endIdx = destIdx !== -1 ? destIdx : timeline.length - 1;
-    let closestIdx = 0;
-    let closestDist = Infinity;
-    for (let i = 0; i <= endIdx; i++) {
-      const dist = haversineDistance(
-        [activeVehicle.lon, activeVehicle.lat],
-        [timeline[i].lon, timeline[i].lat]
-      );
-      if (dist < closestDist) {
-        closestDist = dist;
-        closestIdx = i;
-      }
-    }
-    return timeline.slice(closestIdx, endIdx + 1);
-  }, [timeline, activeVehicle, destination]);
-
-  // Compute position-based ETAs cumulatively in stop-sequence order.
-  // Walks vehicle → stop[0] → stop[1] → ... using haversineDistance with a
-  // road-detour factor. This guarantees monotonically increasing ETAs and avoids
-  // nearestPointOnLine snapping to the wrong loop iteration on circular routes.
-  const DETOUR_FACTOR = 1.3;
-  const timelineEtas = useMemo(() => {
-    if (!activeVehicle || visibleTimeline.length === 0) return {} as Record<string, number>;
-    const nowSecs = Date.now() / 1000;
-    const speed = (activeVehicle.speed ?? 0) > BLEND_MIN_SPEED_MPS ? activeVehicle.speed! : AVG_SPEED_MPS;
-    const result: Record<string, number> = {};
-    let prevLngLat: [number, number] = [activeVehicle.lon, activeVehicle.lat];
-    let cumulativeSecs = 0;
-    for (const stop of visibleTimeline) {
-      const stopLngLat: [number, number] = [stop.lon, stop.lat];
-      cumulativeSecs += (haversineDistance(prevLngLat, stopLngLat) * DETOUR_FACTOR) / speed;
-      result[stop.stop_id] = nowSecs + cumulativeSecs;
-      prevLngLat = stopLngLat;
-    }
-    return result;
-  }, [activeVehicle, visibleTimeline]);
-
-  const formatTime = (unixTime: number | null): string => {
-    if (!unixTime) return "";
-    const d = new Date(unixTime * 1000);
-    return d.toLocaleTimeString("en-US", {
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true,
-    });
-  };
 
   if (loading) {
     return (
@@ -695,118 +606,6 @@ export function TrackingPreBoardScreen() {
               </div>
               <div className="mt-1 text-sm text-gray-600">At {origin}</div>
             </div>
-          )}
-
-          {/* Timeline toggle */}
-          {!showTimeline && visibleTimeline.length > 0 && (
-            <button
-              onClick={() => setShowTimeline(true)}
-              className="mb-3 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-gray-50 py-3 font-medium text-gray-700 transition-all hover:bg-gray-100"
-            >
-              <List className="h-5 w-5" />
-              See route timeline
-            </button>
-          )}
-
-          {/* Timeline */}
-          {showTimeline && visibleTimeline.length > 0 && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: "auto" }}
-              className="mb-6"
-            >
-              <div className="mb-3 flex items-center justify-between">
-                <div className="text-sm font-medium text-gray-500">Route timeline</div>
-                <button
-                  onClick={() => setShowTimeline(false)}
-                  className="cursor-pointer text-sm text-gray-500 hover:text-gray-700"
-                >
-                  Hide
-                </button>
-              </div>
-
-              <div className="relative">
-                <div
-                  className="absolute bottom-0 left-[11px] top-0 w-0.5"
-                  style={{ backgroundColor: `${shuttle.color}30` }}
-                />
-                <div className="space-y-0">
-                  {visibleTimeline.map((stop, index) => {
-                    const isOrigin =
-                      stop.stop_name.toLowerCase().includes(origin.toLowerCase()) ||
-                      origin.toLowerCase().includes(stop.stop_name.toLowerCase());
-                    const isFirst = index === 0;
-
-                    return (
-                      <motion.div
-                        key={stop.stop_id}
-                        initial={{ x: -20, opacity: 0 }}
-                        animate={{ x: 0, opacity: 1 }}
-                        transition={{ delay: index * 0.1 }}
-                        className="relative pb-6 last:pb-0"
-                      >
-                        <div
-                          className={`-ml-3 flex items-start gap-4 rounded-xl p-3 transition-colors ${isOrigin ? "border-2" : ""}`}
-                          style={
-                            isOrigin
-                              ? { borderColor: shuttle.color, backgroundColor: `${shuttle.color}10` }
-                              : {}
-                          }
-                        >
-                          <div className="relative z-10 shrink-0">
-                            {isFirst ? (
-                              <div
-                                className="flex h-6 w-6 items-center justify-center rounded-lg"
-                                style={{ backgroundColor: shuttle.color }}
-                              >
-                                <Bus className="h-4 w-4 text-white" />
-                              </div>
-                            ) : (
-                              <div
-                                className="flex h-6 w-6 items-center justify-center rounded-full border-2 bg-white"
-                                style={{ borderColor: shuttle.color }}
-                              >
-                                {isOrigin && (
-                                  <div
-                                    className="h-2 w-2 rounded-full"
-                                    style={{ backgroundColor: shuttle.color }}
-                                  />
-                                )}
-                              </div>
-                            )}
-                          </div>
-
-                          <div className="flex-1 pt-0.5">
-                            <div className="font-medium text-gray-900">{stop.stop_name}</div>
-                            {isFirst && busState?.type === "arriving" && (
-                              <div className="text-sm text-gray-500">Approaching</div>
-                            )}
-                            {isFirst && busState?.type !== "arriving" && (
-                              <div className="text-sm text-gray-500">Shuttle is here now</div>
-                            )}
-                            {isOrigin && !isFirst && (
-                              <div className="text-sm" style={{ color: shuttle.color }}>
-                                Your stop
-                              </div>
-                            )}
-                          </div>
-
-                          <div className="pt-0.5 text-right">
-                            {/* First stop: show ETA when arriving (not yet there), hide when dwelling */}
-                            {(!isFirst || busState?.type === "arriving") && timelineEtas[stop.stop_id] != null && (
-                              <div className="flex items-center gap-1 text-sm font-medium text-gray-500">
-                                <Clock className="h-4 w-4" />
-                                <span>~{formatTime(timelineEtas[stop.stop_id])}</span>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </motion.div>
-                    );
-                  })}
-                </div>
-              </div>
-            </motion.div>
           )}
 
           {/* Missed button */}

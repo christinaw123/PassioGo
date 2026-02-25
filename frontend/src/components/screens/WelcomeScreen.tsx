@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useLocation } from "react-router";
 import { Map } from "../Map";
 import { StopMarker } from "../StopMarker";
@@ -24,22 +24,14 @@ export function WelcomeScreen() {
   } = location.state || {};
 
   const [stops, setStops] = useState<Stop[]>([]);
-  const [origin, setOrigin] = useState<string>(
-    stateOrigin || sessionStorage.getItem("shuttle_origin") || ""
-  );
-  const [destination, setDestination] = useState<string>(
-    stateDestination || sessionStorage.getItem("shuttle_destination") || ""
-  );
+  const [origin, setOrigin] = useState<string>(stateOrigin || "");
+  const [destination, setDestination] = useState<string>(stateDestination || "");
   const [selectionMode, setSelectionMode] = useState<"origin" | "destination">(
     () => {
       if (returningFrom === "shuttle-selection") {
         if (stateOrigin && !stateDestination) return "destination";
         if (stateDestination && !stateOrigin) return "origin";
       }
-      // If we restored an origin from session, jump to destination mode
-      const restoredOrigin =
-        stateOrigin || sessionStorage.getItem("shuttle_origin");
-      if (restoredOrigin && !returningFrom) return "destination";
       return "origin";
     }
   );
@@ -48,35 +40,43 @@ export function WelcomeScreen() {
     lat: number;
     lng: number;
   } | null>(null);
+  const hasAutoZoomedRef = useRef(false);
   const [showUnreachablePopup, setShowUnreachablePopup] = useState(false);
   const [unreachableStopName, setUnreachableStopName] = useState("");
   const [reachableStopIds, setReachableStopIds] = useState<Set<string>>(
     new Set()
   );
 
-  // Get user location on mount
+  // Clear any stale sessionStorage values left by old code
+  useEffect(() => {
+    sessionStorage.removeItem("shuttle_origin");
+    sessionStorage.removeItem("shuttle_destination");
+  }, []);
+
+  // Watch user location continuously — cleans up on unmount so re-mounts start fresh
   useEffect(() => {
     if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(
+    const id = navigator.geolocation.watchPosition(
       (pos) =>
         setUserLocation({
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
         }),
-      () => {
-        /* permission denied or unavailable — no dot shown */
-      },
-      { enableHighAccuracy: true }
+      () => { /* permission denied or unavailable */ },
+      { enableHighAccuracy: false, timeout: 5000, maximumAge: 30000 }
     );
+    return () => navigator.geolocation.clearWatch(id);
   }, []);
 
-  // Persist origin/destination to sessionStorage
+  // Fly to user location once — fires as soon as both map and location are ready
   useEffect(() => {
-    if (origin) sessionStorage.setItem("shuttle_origin", origin);
-    else sessionStorage.removeItem("shuttle_origin");
-    if (destination) sessionStorage.setItem("shuttle_destination", destination);
-    else sessionStorage.removeItem("shuttle_destination");
-  }, [origin, destination]);
+    if (!mapInstance || !userLocation || hasAutoZoomedRef.current) return;
+    hasAutoZoomedRef.current = true;
+    mapInstance.flyTo({
+      center: [userLocation.lng, userLocation.lat],
+      zoom: 15.5,
+    });
+  }, [mapInstance, userLocation]);
 
   // Fetch all stops from backend
   useEffect(() => {
@@ -136,6 +136,18 @@ export function WelcomeScreen() {
       if (selectionMode === "origin") {
         setOrigin(stop.name);
         setSelectionMode("destination");
+        // Zoom out to fit all stops so the user can pick a destination
+        if (mapInstance && stops.length > 0) {
+          const lngs = stops.map((s) => s.lon);
+          const lats = stops.map((s) => s.lat);
+          mapInstance.fitBounds(
+            [
+              [Math.min(...lngs), Math.min(...lats)],
+              [Math.max(...lngs), Math.max(...lats)],
+            ],
+            { padding: { top: 60, bottom: 220, left: 40, right: 40 }, maxZoom: 14 }
+          );
+        }
       } else {
         if (stop.name === origin) return;
 
@@ -148,16 +160,13 @@ export function WelcomeScreen() {
         setDestination(stop.name);
       }
     },
-    [selectionMode, origin, reachableStopIds]
+    [selectionMode, origin, reachableStopIds, mapInstance, stops]
   );
 
-  // Locate button: zoom to user's current position
+  // Locate button: fly to the position already tracked by watchPosition
   const handleCurrentLocationClick = () => {
-    if (userLocation && mapInstance) {
-      mapInstance.flyTo({
-        center: [userLocation.lng, userLocation.lat],
-        zoom: 15,
-      });
+    if (mapInstance && userLocation) {
+      mapInstance.flyTo({ center: [userLocation.lng, userLocation.lat], zoom: 15.5 });
     }
   };
 
@@ -166,6 +175,18 @@ export function WelcomeScreen() {
     if (origin) {
       setOrigin("");
       setDestination("");
+    }
+    // Zoom out to show all stops so the user can pick one
+    if (mapInstance && stops.length > 0) {
+      const lngs = stops.map((s) => s.lon);
+      const lats = stops.map((s) => s.lat);
+      mapInstance.fitBounds(
+        [
+          [Math.min(...lngs), Math.min(...lats)],
+          [Math.max(...lngs), Math.max(...lats)],
+        ],
+        { padding: { top: 60, bottom: 220, left: 40, right: 40 }, maxZoom: 14 }
+      );
     }
   };
 

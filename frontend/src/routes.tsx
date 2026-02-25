@@ -1,15 +1,10 @@
 import { createBrowserRouter, Navigate } from "react-router";
-import { DemoScreen } from "./components/screens/DemoScreen";
 import { WelcomeScreen } from "./components/screens/WelcomeScreen";
 import { ShuttleSelectionScreen } from "./components/screens/ShuttleSelectionScreen";
 import { TrackingPreBoardScreen } from "./components/screens/TrackingPreBoardScreen";
 import { ListViewScreen } from "./components/screens/ListViewScreen";
 
 export const router = createBrowserRouter([
-  {
-    path: "/demo",
-    Component: DemoScreen,
-  },
   {
     path: "/",
     Component: WelcomeScreen,
