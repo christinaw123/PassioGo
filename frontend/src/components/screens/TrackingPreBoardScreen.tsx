@@ -41,6 +41,29 @@ type BusState =
   | { type: "departed"; vehicle: Vehicle | null; nextDepartures: NextDeparture[] }
   | { type: "no-data"; nextDepartures: NextDeparture[] };
 
+// ─── Layout knobs ────────────────────────────────────────────────────────────
+/** Top margin for the sheet content area, in px */
+const SHEET_CONTENT_TOP_MARGIN = 12;    // try: 4   8   12  16
+/** Bottom margin below the route header block, in px */
+const HEADER_MARGIN_BOTTOM = 16;       // try: 12  16  20  24
+/** Gap between the route color icon and the route name/destination text, in px */
+const HEADER_GAP = 12;                 // try: 8   12  16
+/** Size (width & height) of the route color icon, in px */
+const HEADER_ICON_SIZE = 48;           // try: 36  40  44  48
+/** Corner radius of the route color icon, in px */
+const HEADER_ICON_RADIUS = 12;         // try: 8   10  12  16
+/** Corner radius of the status card (arriving / dwelling / no-data), in px */
+const STATUS_CARD_RADIUS = 16;         // try: 8   12  16  20  24
+/** Padding inside the status card, in px */
+const STATUS_CARD_PADDING = 16;        // try: 12  16  20  24
+/** Bottom margin below the status card, in px */
+const STATUS_CARD_MARGIN = 24;         // try: 12  16  20  24
+/** Corner radius of the "View Available Shuttles" button, in px */
+const MISSED_BTN_RADIUS = 16;          // try: 8   12  16  20  24
+/** Vertical padding of the "View Available Shuttles" button, in px */
+const MISSED_BTN_PADDING_Y = 16;       // try: 10  12  14  16
+// ─────────────────────────────────────────────────────────────────────────────
+
 const AVG_SPEED_MPS = 5.4;
 /** Tight haversine fallback for dwell (when no stop_id available). 50 m keeps
  *  "at stop now" from firing for a bus parked on the other side of a building. */
@@ -515,8 +538,8 @@ export function TrackingPreBoardScreen() {
             initial={{ opacity: 0, y: -20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
-            className="absolute left-4 right-4 top-24 z-40 rounded-2xl bg-white p-4 shadow-xl"
-            style={{ borderLeft: `4px solid ${shuttle.color}` }}
+            className="absolute left-4 right-4 top-24 z-40 bg-white shadow-xl"
+            style={{ borderRadius: STATUS_CARD_RADIUS, padding: STATUS_CARD_PADDING, borderLeft: `4px solid ${shuttle.color}` }}
           >
             <div className="mb-1 font-medium text-gray-900">Your shuttle has left.</div>
             <div className="mb-3 text-sm text-gray-500">
@@ -544,12 +567,12 @@ export function TrackingPreBoardScreen() {
 
       {/* Bottom sheet */}
       <BottomSheet height="auto">
-        <div className="mt-2 pb-2">
+        <div style={{ marginTop: SHEET_CONTENT_TOP_MARGIN, paddingBottom: 8 }}>
           {/* Route header */}
-          <div className="mb-6 flex items-center gap-3">
+          <div className="flex items-center" style={{ marginBottom: HEADER_MARGIN_BOTTOM, gap: HEADER_GAP }}>
             <div
-              className="flex h-12 w-12 items-center justify-center rounded-xl"
-              style={{ backgroundColor: shuttle.color }}
+              className="flex shrink-0 items-center justify-center"
+              style={{ backgroundColor: shuttle.color, width: HEADER_ICON_SIZE, height: HEADER_ICON_SIZE, borderRadius: HEADER_ICON_RADIUS }}
             >
               <Bus className="h-6 w-6 text-white" />
             </div>
@@ -565,7 +588,8 @@ export function TrackingPreBoardScreen() {
               initial={{ scale: 0.95 }}
               animate={{ scale: 1 }}
               transition={{ repeat: Infinity, repeatType: "reverse", duration: 1.5 }}
-              className="mb-6 rounded-2xl bg-blue-50 p-4 text-center"
+              className="bg-blue-50 text-center"
+              style={{ borderRadius: STATUS_CARD_RADIUS, padding: STATUS_CARD_PADDING, marginBottom: STATUS_CARD_MARGIN }}
             >
               <div className="mb-1 text-3xl">🚌</div>
               <div className="text-lg font-medium">
@@ -580,8 +604,8 @@ export function TrackingPreBoardScreen() {
               initial={{ scale: 0.95 }}
               animate={{ scale: 1 }}
               transition={{ repeat: Infinity, repeatType: "reverse", duration: 1.5 }}
-              className="mb-6 rounded-2xl p-4 text-center"
-              style={{ backgroundColor: `${shuttle.color}15` }}
+              className="text-center"
+              style={{ backgroundColor: `${shuttle.color}15`, borderRadius: STATUS_CARD_RADIUS, padding: STATUS_CARD_PADDING, marginBottom: STATUS_CARD_MARGIN }}
             >
               <div className="mb-1 text-3xl">🚌</div>
               <div className="text-lg font-medium" style={{ color: shuttle.color }}>
@@ -597,7 +621,7 @@ export function TrackingPreBoardScreen() {
           )}
 
           {(busState?.type === "departed" || busState?.type === "no-data") && (
-            <div className="mb-6 rounded-2xl bg-gray-50 p-4 text-center">
+            <div className="bg-gray-50 text-center" style={{ borderRadius: STATUS_CARD_RADIUS, padding: STATUS_CARD_PADDING, marginBottom: STATUS_CARD_MARGIN }}>
               <div className="mb-1 text-3xl">🕐</div>
               <div className="text-lg font-medium text-gray-700">
                 {busState.nextDepartures.length > 0
@@ -608,12 +632,13 @@ export function TrackingPreBoardScreen() {
             </div>
           )}
 
-          {/* Missed button */}
+          {/* Back to shuttles button */}
           <button
-            onClick={() => navigate("/")}
-            className="mt-3 w-full cursor-pointer rounded-2xl bg-gray-100 py-4 font-medium text-gray-700 transition-all hover:bg-gray-200"
+            onClick={() => navigate("/shuttle-selection", { state: { origin, destination } })}
+            className="mt-3 w-full cursor-pointer bg-gray-100 font-medium text-gray-700 transition-all hover:bg-gray-200"
+            style={{ borderRadius: MISSED_BTN_RADIUS, paddingTop: MISSED_BTN_PADDING_Y, paddingBottom: MISSED_BTN_PADDING_Y }}
           >
-            I missed this shuttle
+            View Available Shuttles
           </button>
         </div>
       </BottomSheet>
