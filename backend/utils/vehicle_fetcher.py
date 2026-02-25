@@ -173,9 +173,11 @@ def get_trip_timeline(trip_id: str) -> List[Dict[str, Any]]:
     timeline: List[Dict[str, Any]] = []
     for st in static_stops:
         stop_id = st.get("stop_id")
-        stop_row = gtfs.stop_row_by_stop_id.get(stop_id, {})
+        if not stop_id:
+            continue
+        stop_row = gtfs.stop_row_by_stop_id.get(stop_id) or {}
 
-        pred = predictions.get(stop_id, {})
+        pred = predictions.get(stop_id) or {}
         arrival_pred = pred.get("arrival") or {}
         departure_pred = pred.get("departure") or {}
 

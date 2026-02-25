@@ -56,6 +56,7 @@ interface ShuttleOption {
 const AVG_SPEED_MPS = 5.4;
 const DWELL_DISTANCE_M = 100;
 const BLEND_MIN_SPEED_MPS = 1.0;
+const MAX_OFF_ROUTE_M = 500;
 
 function detectBusState(
   vehicles: Vehicle[],
@@ -86,6 +87,8 @@ function detectBusState(
 
     for (const v of vehicles) {
       const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
+      // Skip vehicles too far from the route shape (deadheading / stale trip_id)
+      if (vProj.dist > MAX_OFF_ROUTE_M) continue;
       // Only consider vehicles that haven't passed origin yet
       if (
         vProj.segIndex > originProj.segIndex ||

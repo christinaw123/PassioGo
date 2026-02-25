@@ -53,6 +53,9 @@ const DWELL_DISTANCE_M = 100;
 const BLEND_MIN_SPEED_MPS = 1.0;
 /** Show vehicle icon up to this many meters past origin before hiding it */
 const DEPARTED_SHOW_DISTANCE_M = 500;
+/** Ignore vehicles whose GPS is more than this far from the route shape — filters
+ *  deadheading buses or stale trip_ids broadcasting from a different route */
+const MAX_OFF_ROUTE_M = 500;
 
 function detectBusState(
   vehicles: Vehicle[],
@@ -83,6 +86,8 @@ function detectBusState(
     // Check for vehicles approaching (before origin)
     for (const v of vehicles) {
       const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
+      // Skip vehicles too far from the route shape (deadheading / stale trip_id)
+      if (vProj.dist > MAX_OFF_ROUTE_M) continue;
       if (
         vProj.segIndex > originProj.segIndex ||
         (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
@@ -122,6 +127,7 @@ function detectBusState(
     for (const v of vehicles) {
       const dist = haversineDistance([v.lon, v.lat], originLngLat);
       const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
+      if (vProj.dist > MAX_OFF_ROUTE_M) continue;
       const isPast =
         vProj.segIndex > originProj.segIndex ||
         (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t);
@@ -372,17 +378,52 @@ export function TrackingPreBoardScreen() {
     return null;
   }, [busState, showDepartedVehicle]);
 
-  // Filter timeline
+  // Filter timeline — clip at destination first, then find the closest stop to the
+  // vehicle within that range. Computing destIdx first prevents closestIdx from
+  // landing on a stop past the destination (which would make the slice empty).
   const visibleTimeline = useMemo(() => {
     if (timeline.length === 0 || !activeVehicle) return timeline;
-    const vehicleSeq = activeVehicle.current_stop_sequence;
-    if (vehicleSeq == null) return timeline;
-    return timeline.filter((s) => s.stop_sequence >= vehicleSeq);
-  }, [timeline, activeVehicle]);
+    const destIdx = timeline.findIndex(
+      (s) =>
+        s.stop_name.toLowerCase().includes(destination.toLowerCase()) ||
+        destination.toLowerCase().includes(s.stop_name.toLowerCase())
+    );
+    const endIdx = destIdx !== -1 ? destIdx : timeline.length - 1;
+    let closestIdx = 0;
+    let closestDist = Infinity;
+    for (let i = 0; i <= endIdx; i++) {
+      const dist = haversineDistance(
+        [activeVehicle.lon, activeVehicle.lat],
+        [timeline[i].lon, timeline[i].lat]
+      );
+      if (dist < closestDist) {
+        closestDist = dist;
+        closestIdx = i;
+      }
+    }
+    return timeline.slice(closestIdx, endIdx + 1);
+  }, [timeline, activeVehicle, destination]);
 
-  const handleBoardShuttle = () => {
-    navigate("/tracking-on-board", { state: { origin, destination, shuttle } });
-  };
+  // Compute position-based ETAs cumulatively in stop-sequence order.
+  // Walks vehicle → stop[0] → stop[1] → ... using haversineDistance with a
+  // road-detour factor. This guarantees monotonically increasing ETAs and avoids
+  // nearestPointOnLine snapping to the wrong loop iteration on circular routes.
+  const DETOUR_FACTOR = 1.3;
+  const timelineEtas = useMemo(() => {
+    if (!activeVehicle || visibleTimeline.length === 0) return {} as Record<string, number>;
+    const nowSecs = Date.now() / 1000;
+    const speed = (activeVehicle.speed ?? 0) > BLEND_MIN_SPEED_MPS ? activeVehicle.speed! : AVG_SPEED_MPS;
+    const result: Record<string, number> = {};
+    let prevLngLat: [number, number] = [activeVehicle.lon, activeVehicle.lat];
+    let cumulativeSecs = 0;
+    for (const stop of visibleTimeline) {
+      const stopLngLat: [number, number] = [stop.lon, stop.lat];
+      cumulativeSecs += (haversineDistance(prevLngLat, stopLngLat) * DETOUR_FACTOR) / speed;
+      result[stop.stop_id] = nowSecs + cumulativeSecs;
+      prevLngLat = stopLngLat;
+    }
+    return result;
+  }, [activeVehicle, visibleTimeline]);
 
   const formatTime = (unixTime: number | null): string => {
     if (!unixTime) return "";
@@ -605,8 +646,6 @@ export function TrackingPreBoardScreen() {
                       stop.stop_name.toLowerCase().includes(origin.toLowerCase()) ||
                       origin.toLowerCase().includes(stop.stop_name.toLowerCase());
                     const isFirst = index === 0;
-                    const isDelayed =
-                      stop.arrival_delay != null && stop.arrival_delay > 60;
 
                     return (
                       <motion.div
@@ -649,45 +688,27 @@ export function TrackingPreBoardScreen() {
 
                           <div className="flex-1 pt-0.5">
                             <div className="font-medium text-gray-900">{stop.stop_name}</div>
-                            {isFirst && (
+                            {isFirst && busState?.type === "arriving" && (
+                              <div className="text-sm text-gray-500">Approaching</div>
+                            )}
+                            {isFirst && busState?.type !== "arriving" && (
                               <div className="text-sm text-gray-500">Shuttle is here now</div>
                             )}
                             {isOrigin && !isFirst && (
                               <div className="text-sm" style={{ color: shuttle.color }}>
-                                Your location
+                                Your stop
                               </div>
                             )}
                           </div>
 
                           <div className="pt-0.5 text-right">
-                            {stop.predicted_arrival ? (
-                              isDelayed ? (
-                                <div className="flex flex-col items-end gap-0.5">
-                                  {stop.scheduled_arrival && (
-                                    <div className="text-xs text-gray-400 line-through">
-                                      {stop.scheduled_arrival.slice(0, 5)}
-                                    </div>
-                                  )}
-                                  <div className="flex items-center gap-1 text-sm font-medium text-red-600">
-                                    <Clock className="h-4 w-4" />
-                                    <span>{formatTime(stop.predicted_arrival)}</span>
-                                  </div>
-                                </div>
-                              ) : (
-                                <div
-                                  className="flex items-center gap-1 text-sm font-medium"
-                                  style={{ color: isFirst ? shuttle.color : "#6B7280" }}
-                                >
-                                  <Clock className="h-4 w-4" />
-                                  <span>{formatTime(stop.predicted_arrival)}</span>
-                                </div>
-                              )
-                            ) : stop.scheduled_arrival ? (
+                            {/* First stop: show ETA when arriving (not yet there), hide when dwelling */}
+                            {(!isFirst || busState?.type === "arriving") && timelineEtas[stop.stop_id] != null && (
                               <div className="flex items-center gap-1 text-sm font-medium text-gray-500">
                                 <Clock className="h-4 w-4" />
-                                <span>{stop.scheduled_arrival.slice(0, 5)}</span>
+                                <span>~{formatTime(timelineEtas[stop.stop_id])}</span>
                               </div>
-                            ) : null}
+                            )}
                           </div>
                         </div>
                       </motion.div>
@@ -697,15 +718,6 @@ export function TrackingPreBoardScreen() {
               </div>
             </motion.div>
           )}
-
-          {/* Board button */}
-          <button
-            onClick={handleBoardShuttle}
-            className="w-full cursor-pointer rounded-2xl py-4 font-medium text-white shadow-lg transition-all hover:shadow-xl"
-            style={{ backgroundColor: shuttle.color }}
-          >
-            I'm on this shuttle
-          </button>
 
           {/* Missed button */}
           <button
