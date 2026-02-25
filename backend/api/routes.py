@@ -1,4 +1,5 @@
 import time
+from datetime import date
 
 from flask import jsonify, request
 
@@ -186,6 +187,149 @@ def api_routes_between():
         "destination": destination,
         "routes": unique_routes,
     })
+
+
+@api_bp.route("/next-departures")
+def api_next_departures():
+    """Return next scheduled departures for a stop on a route.
+    Query params: ?stop_id=<id>&route_id=<id>&limit=<n>&vehicle_trip_id=<id>
+
+    vehicle_trip_id: optional — if provided, that trip's departure is included
+    even if it's up to 5 minutes in the past (handles a vehicle dwelling
+    slightly past its scheduled departure time).
+    """
+    stop_id = request.args.get("stop_id")
+    route_id = request.args.get("route_id")
+    vehicle_trip_id = request.args.get("vehicle_trip_id")
+    try:
+        limit = int(request.args.get("limit", "3"))
+    except ValueError:
+        limit = 3
+
+    if not stop_id or not route_id:
+        return json_error("Missing 'stop_id' and/or 'route_id' query parameters")
+
+    active_service_ids = gtfs.get_active_service_ids(date.today())
+    trips_for_route = gtfs.trips_grouped_by_route_id.get(route_id, [])
+
+    now_unix = int(time.time())
+    DWELL_GRACE_S = 300  # 5 minutes — allow vehicle_trip_id's departure if recently passed
+    departures = []
+
+    from datetime import datetime as _dt
+    for trip_row in trips_for_route:
+        service_id = trip_row.get("service_id", "")
+        if service_id not in active_service_ids:
+            continue
+        trip_id = trip_row.get("trip_id")
+        if not trip_id:
+            continue
+        stop_times = gtfs.stop_times_by_trip_id.get(trip_id, [])
+        is_vehicle_trip = trip_id == vehicle_trip_id
+
+        # For the vehicle's own trip, find the terminal stop_sequence so we can
+        # skip that occurrence — the vehicle is arriving there, not departing.
+        terminal_seq = None
+        if is_vehicle_trip and stop_times:
+            try:
+                terminal_seq = max(int(s.get("stop_sequence", 0)) for s in stop_times)
+            except ValueError:
+                pass
+
+        for st in stop_times:
+            if st.get("stop_id") != stop_id:
+                continue
+            # Skip if this is the last stop of the vehicle's current trip;
+            # the shuttle is pulling into its terminal, not about to depart.
+            if terminal_seq is not None:
+                try:
+                    if int(st.get("stop_sequence", 0)) == terminal_seq:
+                        break
+                except ValueError:
+                    pass
+            dep_time_str = st.get("departure_time") or st.get("arrival_time", "")
+            if not dep_time_str:
+                continue
+            try:
+                dep_unix = gtfs.gtfs_time_to_today_unix(dep_time_str)
+            except ValueError:
+                continue
+            # Include if in the future, or if this is the vehicle's current trip
+            # and departure was within the dwell grace window
+            cutoff = now_unix - DWELL_GRACE_S if is_vehicle_trip else now_unix
+            if dep_unix > cutoff:
+                dep_display = _dt.fromtimestamp(dep_unix).strftime("%-I:%M %p")
+                departures.append({
+                    "trip_id": trip_id,
+                    "departure_unix": dep_unix,
+                    "departure_display": dep_display,
+                })
+            break  # only one stop_time entry per stop per trip
+
+    departures.sort(key=lambda d: d["departure_unix"])
+    return jsonify({
+        "stop_id": stop_id,
+        "route_id": route_id,
+        "departures": departures[:limit],
+    })
+
+
+@api_bp.route("/scheduled-arrival")
+def api_scheduled_arrival():
+    """Scheduled departure time for a specific trip at a specific stop.
+
+    Finds the first non-terminal occurrence of stop_id in the trip's stop_times,
+    which is the scheduled departure for a dwelling vehicle.  If the stop is the
+    terminal (last stop) of the trip the vehicle is pulling in, not departing.
+
+    Query params: ?trip_id=<id>&stop_id=<id>
+    """
+    trip_id = request.args.get("trip_id")
+    stop_id = request.args.get("stop_id")
+    if not trip_id or not stop_id:
+        return json_error("Missing 'trip_id' and/or 'stop_id' query parameters")
+
+    stop_times = gtfs.stop_times_by_trip_id.get(trip_id)
+    if not stop_times:
+        return json_error(f"No stop times found for trip '{trip_id}'", 404)
+
+    sorted_stops = sorted(stop_times, key=lambda s: int(s.get("stop_sequence", 0)))
+    terminal_seq = int(sorted_stops[-1].get("stop_sequence", 0)) if sorted_stops else -1
+
+    now_unix = int(time.time())
+    GRACE_S = 600  # 10 min: vehicle may still be at stop slightly past scheduled departure
+
+    from datetime import datetime as _dt
+    for st in sorted_stops:
+        if st.get("stop_id") != stop_id:
+            continue
+        try:
+            seq = int(st.get("stop_sequence", 0))
+        except ValueError:
+            continue
+        if seq == terminal_seq:
+            return json_error(
+                f"Stop '{stop_id}' is the terminal of trip '{trip_id}' — vehicle is arriving, not departing",
+                404,
+            )
+        dep_str = st.get("departure_time") or st.get("arrival_time", "")
+        if not dep_str:
+            continue
+        try:
+            dep_unix = gtfs.gtfs_time_to_today_unix(dep_str)
+        except ValueError:
+            continue
+        if dep_unix >= now_unix - GRACE_S:
+            return jsonify({
+                "trip_id": trip_id,
+                "stop_id": stop_id,
+                "departure_unix": dep_unix,
+                "departure_display": _dt.fromtimestamp(dep_unix).strftime("%-I:%M %p"),
+            })
+
+    return json_error(
+        f"No upcoming scheduled departure for stop '{stop_id}' in trip '{trip_id}'", 404
+    )
 
 
 @api_bp.route("/eta")

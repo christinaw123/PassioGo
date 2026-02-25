@@ -136,7 +136,12 @@ def get_eta_for_stop(stop_id: str) -> List[Dict[str, Any]]:
             })
 
     # sort by arrival time (soonest first)
-    etas.sort(key=lambda e: e.get("arrival_time") or float("inf"))
+    etas.sort(key=lambda e: e.get("arrival_time", float("inf")))
+
+    # drop arrivals that have already passed
+    now = int(time.time())
+    etas = [e for e in etas if e.get("arrival_time") is None or e["arrival_time"] > now]
+
     return etas
 
 

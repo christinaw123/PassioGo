@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { useNavigate, useLocation } from "react-router";
 import { Map } from "../Map";
 import { StopMarker } from "../StopMarker";
@@ -12,6 +12,7 @@ import {
   nearestPointOnLine,
   clipLineSegment,
   lineLength,
+  haversineDistance,
 } from "../../utils/geo";
 
 interface RouteInfo {
@@ -33,16 +34,93 @@ interface Vehicle {
   stop_name: string | null;
 }
 
+interface NextDeparture {
+  trip_id: string;
+  departure_unix: number;
+  departure_display: string;
+}
+
+type BusState =
+  | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
+  | { type: "dwelling"; vehicle: Vehicle; leavingInMinutes: number | null }
+  | { type: "departed" | "no-data"; nextDepartures: NextDeparture[] };
+
 interface ShuttleOption {
   route: RouteInfo;
   vehicles: Vehicle[];
-  eta: string | null;
-  etaMinutes: number;
+  busState: BusState;
   routeCoords: [number, number][];
 }
 
 /** ~12 mph average shuttle speed in m/s */
 const AVG_SPEED_MPS = 5.4;
+const DWELL_DISTANCE_M = 100;
+const BLEND_MIN_SPEED_MPS = 1.0;
+
+function detectBusState(
+  vehicles: Vehicle[],
+  originStop: { lat: number; lon: number },
+  routeCoords: [number, number][]
+): Omit<BusState, "leavingInMinutes" | "departureDisplay" | "nextDepartures"> & { nextDepartures?: NextDeparture[] } {
+  if (vehicles.length === 0) {
+    return { type: "no-data", nextDepartures: [] };
+  }
+
+  const originLngLat: [number, number] = [originStop.lon, originStop.lat];
+
+  // Check if any vehicle is dwelling (within DWELL_DISTANCE_M of origin stop)
+  for (const v of vehicles) {
+    const dist = haversineDistance([v.lon, v.lat], originLngLat);
+    if (dist <= DWELL_DISTANCE_M) {
+      return { type: "dwelling", vehicle: v };
+    }
+  }
+
+  // Find nearest vehicle approaching the origin stop along the route
+  if (routeCoords.length >= 2) {
+    const originProj = nearestPointOnLine(routeCoords, originLngLat);
+
+    let bestEta = Infinity;
+    let bestVehicle: Vehicle | null = null;
+    let bestTrail: [number, number][] = [];
+
+    for (const v of vehicles) {
+      const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
+      // Only consider vehicles that haven't passed origin yet
+      if (
+        vProj.segIndex > originProj.segIndex ||
+        (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
+      ) {
+        continue;
+      }
+
+      const trail = clipLineSegment(
+        routeCoords,
+        vProj.segIndex,
+        vProj.projPoint,
+        originProj.segIndex,
+        originProj.projPoint
+      );
+      if (trail.length < 2) continue;
+
+      const dist = lineLength(trail);
+      const speed = (v.speed ?? 0) > BLEND_MIN_SPEED_MPS ? v.speed! : AVG_SPEED_MPS;
+      const eta = Math.max(1, Math.round(dist / speed / 60));
+
+      if (eta < bestEta) {
+        bestEta = eta;
+        bestVehicle = v;
+        bestTrail = trail;
+      }
+    }
+
+    if (bestVehicle) {
+      return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
+    }
+  }
+
+  return { type: "departed", nextDepartures: [] };
+}
 
 export function ShuttleSelectionScreen() {
   const navigate = useNavigate();
@@ -54,28 +132,50 @@ export function ShuttleSelectionScreen() {
     stateDestination || sessionStorage.getItem("shuttle_destination") || "";
 
   const [shuttleOptions, setShuttleOptions] = useState<ShuttleOption[]>([]);
-  const [selectedShuttle, setSelectedShuttle] = useState<ShuttleOption | null>(
-    null
-  );
-  const [originStop, setOriginStop] = useState<{
-    id: string;
-    lat: number;
-    lon: number;
-  } | null>(null);
-  const [destStop, setDestStop] = useState<{
-    id: string;
-    lat: number;
-    lon: number;
-  } | null>(null);
+  const [selectedShuttle, setSelectedShuttle] = useState<ShuttleOption | null>(null);
+  const [originStop, setOriginStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
+  const [destStop, setDestStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
   const [loading, setLoading] = useState(true);
   const [mapInstance, setMapInstance] = useState<mapboxgl.Map | null>(null);
 
-  // Redirect to home if no origin/destination (e.g. direct URL visit)
+  // Redirect to home if no origin/destination
   useEffect(() => {
     if (!origin || !destination) navigate("/", { replace: true });
   }, []);
 
-  // Fetch routes, details, vehicles, and ETAs
+  const fetchNextDepartures = useCallback(
+    async (routeId: string, stopId: string): Promise<NextDeparture[]> => {
+      try {
+        const url = `/api/next-departures?route_id=${encodeURIComponent(routeId)}&stop_id=${encodeURIComponent(stopId)}&limit=3`;
+        const res = await fetch(url);
+        if (!res.ok) return [];
+        const data = await res.json();
+        return data.departures || [];
+      } catch {
+        return [];
+      }
+    },
+    []
+  );
+
+  /** Scheduled departure from stop_times.txt for this specific vehicle trip at this stop. */
+  const fetchScheduledDeparture = useCallback(
+    async (tripId: string, stopId: string): Promise<number | null> => {
+      try {
+        const res = await fetch(
+          `/api/scheduled-arrival?trip_id=${encodeURIComponent(tripId)}&stop_id=${encodeURIComponent(stopId)}`
+        );
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.departure_unix ?? null;
+      } catch {
+        return null;
+      }
+    },
+    []
+  );
+
+  // Initial load
   useEffect(() => {
     if (!origin || !destination) return;
 
@@ -90,26 +190,18 @@ export function ShuttleSelectionScreen() {
         );
         if (!rbRes.ok) throw new Error(`HTTP ${rbRes.status}`);
         const rbData = await rbRes.json();
-        const matchingRoutes: { route_id: string; route_name: string }[] =
-          rbData.routes || [];
+        const matchingRoutes: { route_id: string; route_name: string }[] = rbData.routes || [];
 
         if (matchingRoutes.length === 0) {
           setLoading(false);
           return;
         }
 
-        // For each route, fetch route details + vehicles in parallel
         const allOptions: ShuttleOption[] = await Promise.all(
           matchingRoutes.map(async (r) => {
             const [routeRes, vehiclesRes] = await Promise.all([
-              fetch(
-                `/api/route?route=${encodeURIComponent(r.route_name || "")}`,
-                { signal }
-              ),
-              fetch(
-                `/api/vehicles?route=${encodeURIComponent(r.route_name || "")}`,
-                { signal }
-              ),
+              fetch(`/api/route?route=${encodeURIComponent(r.route_name || "")}`, { signal }),
+              fetch(`/api/vehicles?route=${encodeURIComponent(r.route_name || "")}`, { signal }),
             ]);
 
             if (!routeRes.ok || !vehiclesRes.ok) {
@@ -126,125 +218,73 @@ export function ShuttleSelectionScreen() {
               stops: routeData.stops || [],
             };
 
-            // Extract route polyline from GeoJSON
             let routeCoords: [number, number][] = [];
             try {
               const features = routeData.route_geojson?.features;
               if (features && features.length > 0) {
                 routeCoords = features[0].geometry?.coordinates ?? [];
               }
-            } catch {
-              /* GeoJSON unavailable */
-            }
+            } catch { /* GeoJSON unavailable */ }
 
-            // Find origin stop in this route's stops
             const oStop = route.stops.find(
               (s) =>
                 s.name.toLowerCase().includes(origin.toLowerCase()) ||
                 origin.toLowerCase().includes(s.name.toLowerCase())
             );
 
-            // Fetch real ETA if we found the origin stop
-            let etaStr: string | null = null;
-            let etaMinutes = Infinity;
-
-            if (oStop) {
-              if (!originStop) {
-                setOriginStop({ id: oStop.id, lat: oStop.lat, lon: oStop.lon });
-              }
-              try {
-                const etaRes = await fetch(`/api/eta?stop_id=${oStop.id}`, {
-                  signal,
-                });
-                if (etaRes.ok) {
-                  const etaData = await etaRes.json();
-                  if (etaData.etas && etaData.etas.length > 0) {
-                    const routeEta = etaData.etas.find(
-                      (e: { route_id: string }) =>
-                        String(e.route_id) === String(route.route_id)
-                    );
-                    if (routeEta && routeEta.arrival_time) {
-                      const now = Math.floor(Date.now() / 1000);
-                      const mins = Math.max(
-                        0,
-                        Math.round((routeEta.arrival_time - now) / 60)
-                      );
-                      etaStr = `${mins} min`;
-                      etaMinutes = mins;
-                    }
-                  }
-                }
-              } catch {
-                /* ETA unavailable */
-              }
+            if (oStop && !signal.aborted) {
+              setOriginStop((prev) => prev ?? { id: oStop.id, lat: oStop.lat, lon: oStop.lon });
             }
 
-            // Find destination stop
             const dStop = route.stops.find(
               (s) =>
                 s.name.toLowerCase().includes(destination.toLowerCase()) ||
                 destination.toLowerCase().includes(s.name.toLowerCase())
             );
-            if (dStop && !destStop) {
-              setDestStop({ id: dStop.id, lat: dStop.lat, lon: dStop.lon });
+            if (dStop && !signal.aborted) {
+              setDestStop((prev) => prev ?? { id: dStop.id, lat: dStop.lat, lon: dStop.lon });
             }
 
             const vehicles: Vehicle[] = vehiclesData.vehicles || [];
 
-            // If no real ETA, estimate from nearest vehicle's distance along route
-            if (
-              etaMinutes === Infinity &&
-              oStop &&
-              routeCoords.length >= 2 &&
-              vehicles.length > 0
-            ) {
-              const originProj = nearestPointOnLine(routeCoords, [
-                oStop.lon,
-                oStop.lat,
-              ]);
-              for (const v of vehicles) {
-                const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
-                if (
-                  vProj.segIndex < originProj.segIndex ||
-                  (vProj.segIndex === originProj.segIndex &&
-                    vProj.t <= originProj.t)
-                ) {
-                  const trail = clipLineSegment(
-                    routeCoords,
-                    vProj.segIndex,
-                    vProj.projPoint,
-                    originProj.segIndex,
-                    originProj.projPoint
-                  );
-                  const dist = lineLength(trail);
-                  const estMin = Math.max(
-                    1,
-                    Math.round(dist / AVG_SPEED_MPS / 60)
-                  );
-                  etaMinutes = Math.min(etaMinutes, estMin);
-                }
+            let busState: BusState;
+            if (oStop) {
+              const raw = detectBusState(vehicles, oStop, routeCoords);
+              if (raw.type === "dwelling") {
+                const dwellingVehicle = (raw as { vehicle: Vehicle }).vehicle;
+                const depUnix = await fetchScheduledDeparture(dwellingVehicle.trip_id, oStop.id);
+                const leavingIn = depUnix != null
+                  ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
+                  : null;
+                busState = { type: "dwelling", vehicle: dwellingVehicle, leavingInMinutes: leavingIn };
+              } else if (raw.type === "departed" || raw.type === "no-data") {
+                const nextDepartures = await fetchNextDepartures(route.route_id, oStop.id);
+                busState = { type: raw.type, nextDepartures };
+              } else {
+                busState = raw as BusState;
               }
-              if (etaMinutes !== Infinity) {
-                etaStr = `~${etaMinutes} min`;
-              }
+            } else {
+              busState = { type: "no-data", nextDepartures: [] };
             }
 
-            return {
-              route,
-              vehicles,
-              eta: etaStr,
-              etaMinutes,
-              routeCoords,
-            };
+            return { route, vehicles, busState, routeCoords };
           })
         );
 
-        // Only keep routes with active vehicles, sorted by ETA
-        const activeOptions = allOptions
-          .filter((opt) => opt.vehicles.length > 0)
-          .sort((a, b) => a.etaMinutes - b.etaMinutes);
+        // Sort: arriving first (by ETA), then dwelling, then departed/no-data
+        const sorted = allOptions.sort((a, b) => {
+          const rank = (s: BusState) =>
+            s.type === "arriving" ? 0 : s.type === "dwelling" ? 1 : 2;
+          const ra = rank(a.busState);
+          const rb = rank(b.busState);
+          if (ra !== rb) return ra - rb;
+          if (a.busState.type === "arriving" && b.busState.type === "arriving") {
+            return a.busState.etaMinutes - b.busState.etaMinutes;
+          }
+          return 0;
+        });
 
-        if (!signal.aborted) setShuttleOptions(activeOptions);
+        if (!signal.aborted) setShuttleOptions(sorted);
       } catch (e) {
         if (e instanceof Error && e.name !== "AbortError") {
           console.error("Failed to load shuttle data:", e);
@@ -258,29 +298,31 @@ export function ShuttleSelectionScreen() {
     return () => controller.abort();
   }, [origin, destination]);
 
-  // Fit map to show origin and destination
+  // Fit map to origin + destination
   useEffect(() => {
     if (!mapInstance || !originStop || !destStop) return;
-
     const bounds = new mapboxgl.LngLatBounds();
     bounds.extend([originStop.lon, originStop.lat]);
     bounds.extend([destStop.lon, destStop.lat]);
-
     mapInstance.fitBounds(bounds, {
       padding: { top: 80, bottom: 420, left: 60, right: 60 },
       maxZoom: 16,
     });
   }, [mapInstance, originStop, destStop]);
 
-  // Poll vehicle positions every 5s — use ref to avoid stale closure
+  // Poll every 5s
   const shuttleOptionsRef = useRef(shuttleOptions);
   shuttleOptionsRef.current = shuttleOptions;
+  const originStopRef = useRef(originStop);
+  originStopRef.current = originStop;
 
   useEffect(() => {
     if (shuttleOptions.length === 0) return;
 
     const interval = setInterval(async () => {
       const current = shuttleOptionsRef.current;
+      const oStop = originStopRef.current;
+
       const updated = await Promise.all(
         current.map(async (opt) => {
           try {
@@ -289,7 +331,36 @@ export function ShuttleSelectionScreen() {
             );
             if (!res.ok) return opt;
             const data = await res.json();
-            return { ...opt, vehicles: data.vehicles || [] };
+            const freshVehicles: Vehicle[] = data.vehicles || [];
+
+            const routeOStop = oStop
+              ? oStop
+              : opt.route.stops.find(
+                  (s) =>
+                    s.name.toLowerCase().includes(origin.toLowerCase()) ||
+                    origin.toLowerCase().includes(s.name.toLowerCase())
+                );
+
+            if (!routeOStop) return { ...opt, vehicles: freshVehicles };
+
+            const raw = detectBusState(freshVehicles, routeOStop, opt.routeCoords);
+            let busState: BusState;
+
+            if (raw.type === "dwelling") {
+              const dwellingVehicle = (raw as { vehicle: Vehicle }).vehicle;
+              const depUnix = await fetchScheduledDeparture(dwellingVehicle.trip_id, routeOStop.id);
+              const leavingIn = depUnix != null
+                ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
+                : null;
+              busState = { type: "dwelling", vehicle: dwellingVehicle, leavingInMinutes: leavingIn };
+            } else if (raw.type === "departed" || raw.type === "no-data") {
+              const nextDepartures = await fetchNextDepartures(opt.route.route_id, routeOStop.id);
+              busState = { type: raw.type, nextDepartures };
+            } else {
+              busState = raw as BusState;
+            }
+
+            return { ...opt, vehicles: freshVehicles, busState };
           } catch {
             return opt;
           }
@@ -301,72 +372,57 @@ export function ShuttleSelectionScreen() {
     return () => clearInterval(interval);
   }, [shuttleOptions.length]);
 
-  // For each route, find the nearest vehicle approaching the origin stop
+  // Derive map markers from busState
   const nearestByRoute = useMemo(() => {
-    if (!originStop) return [];
-
     const results: {
       routeId: string;
       vehicle: Vehicle;
-      trail: [number, number][];
+      trail: [number, number][] | null;
       color: string;
       isSelected: boolean;
+      pulsing: boolean;
     }[] = [];
 
     for (const opt of shuttleOptions) {
-      if (opt.routeCoords.length < 2) continue;
-
-      const originProj = nearestPointOnLine(opt.routeCoords, [
-        originStop.lon,
-        originStop.lat,
-      ]);
-
-      let bestDist = Infinity;
-      let bestVehicle: Vehicle | null = null;
-      let bestTrail: [number, number][] = [];
-
-      for (const v of opt.vehicles) {
-        const vProj = nearestPointOnLine(opt.routeCoords, [v.lon, v.lat]);
-
-        // Skip vehicles that have already passed the origin stop
-        if (
-          vProj.segIndex > originProj.segIndex ||
-          (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
-        ) {
-          continue;
-        }
-
-        const coords = clipLineSegment(
-          opt.routeCoords,
-          vProj.segIndex,
-          vProj.projPoint,
-          originProj.segIndex,
-          originProj.projPoint,
-        );
-        if (coords.length < 2) continue;
-
-        const dist = lineLength(coords);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestVehicle = v;
-          bestTrail = coords;
-        }
-      }
-
-      if (bestVehicle && bestTrail.length >= 2) {
+      const { busState } = opt;
+      if (busState.type === "arriving") {
         results.push({
           routeId: opt.route.route_id,
-          vehicle: bestVehicle,
-          trail: bestTrail,
+          vehicle: busState.vehicle,
+          trail: busState.trail,
           color: opt.route.route_color,
-          isSelected:
-            selectedShuttle?.route.route_id === opt.route.route_id,
+          isSelected: selectedShuttle?.route.route_id === opt.route.route_id,
+          pulsing: false,
+        });
+      } else if (busState.type === "dwelling") {
+        results.push({
+          routeId: opt.route.route_id,
+          vehicle: busState.vehicle,
+          trail: null,
+          color: opt.route.route_color,
+          isSelected: selectedShuttle?.route.route_id === opt.route.route_id,
+          pulsing: true,
         });
       }
+      // departed / no-data: no vehicle to show
     }
 
     return results;
-  }, [shuttleOptions, originStop, selectedShuttle]);
+  }, [shuttleOptions, selectedShuttle]);
+
+  // Only show departed/no-data routes if their next departure is within 30 min
+  const SHOW_WINDOW_S = 30 * 60;
+  const visibleOptions = useMemo(() => {
+    const nowSecs = Date.now() / 1000;
+    return shuttleOptions.filter((opt) => {
+      const { busState } = opt;
+      if (busState.type === "arriving" || busState.type === "dwelling") return true;
+      return (
+        busState.nextDepartures.length > 0 &&
+        busState.nextDepartures[0].departure_unix - nowSecs <= SHOW_WINDOW_S
+      );
+    });
+  }, [shuttleOptions]);
 
   const handleConfirm = () => {
     if (selectedShuttle) {
@@ -384,23 +440,45 @@ export function ShuttleSelectionScreen() {
     }
   };
 
+  const renderEtaLabel = (opt: ShuttleOption) => {
+    const { busState } = opt;
+    if (busState.type === "arriving") {
+      return `Arrives in ${busState.etaMinutes} min`;
+    }
+    if (busState.type === "dwelling") {
+      if (busState.leavingInMinutes === 0) return "Departing now";
+      if (busState.leavingInMinutes != null && busState.leavingInMinutes <= 20)
+        return `At stop · leaving in ~${busState.leavingInMinutes} min`;
+      return "At stop now";
+    }
+    if (busState.type === "departed" || busState.type === "no-data") {
+      if (busState.nextDepartures.length > 0) {
+        return `Next at ${busState.nextDepartures[0].departure_display}`;
+      }
+      return "No upcoming departures";
+    }
+    return "";
+  };
+
   return (
     <div className="relative mx-auto h-[100dvh] w-full max-w-[430px] overflow-hidden bg-white">
       {/* Map */}
       <Map onMapReady={setMapInstance}>
         {(map) => (
           <>
-            {/* Route trail lines (nearest vehicle per route) */}
-            {nearestByRoute.map((entry) => (
-              <RouteTrail
-                key={entry.routeId}
-                map={map}
-                id={entry.routeId}
-                coordinates={entry.trail}
-                color={entry.color}
-                isSelected={entry.isSelected}
-              />
-            ))}
+            {/* Route trail lines */}
+            {nearestByRoute
+              .filter((e) => e.trail && e.trail.length >= 2)
+              .map((entry) => (
+                <RouteTrail
+                  key={entry.routeId}
+                  map={map}
+                  id={entry.routeId}
+                  coordinates={entry.trail!}
+                  color={entry.color}
+                  isSelected={entry.isSelected}
+                />
+              ))}
 
             {/* Origin marker */}
             {originStop && (
@@ -424,11 +502,9 @@ export function ShuttleSelectionScreen() {
               />
             )}
 
-            {/* Vehicle markers (nearest per route only) */}
+            {/* Vehicle markers */}
             {(selectedShuttle
-              ? nearestByRoute.filter(
-                  (e) => e.routeId === selectedShuttle.route.route_id
-                )
+              ? nearestByRoute.filter((e) => e.routeId === selectedShuttle.route.route_id)
               : nearestByRoute
             ).map((entry) => (
               <VehicleMarker
@@ -438,6 +514,7 @@ export function ShuttleSelectionScreen() {
                 lat={entry.vehicle.lat}
                 color={entry.color}
                 bearing={entry.vehicle.bearing}
+                pulsing={entry.pulsing}
               />
             ))}
           </>
@@ -468,19 +545,17 @@ export function ShuttleSelectionScreen() {
             <div className="flex items-center justify-center py-8">
               <div className="h-8 w-8 animate-spin rounded-full border-4 border-blue-200 border-t-blue-600" />
             </div>
-          ) : shuttleOptions.length === 0 ? (
+          ) : visibleOptions.length === 0 ? (
             <div className="py-8 text-center text-gray-500">
-              <p className="font-medium">No active shuttles</p>
+              <p className="font-medium">No shuttles in the next 30 min</p>
               <p className="mt-1 text-sm">
-                No shuttles are currently running between {origin} and{" "}
-                {destination}
+                No shuttles are departing between {origin} and {destination} within 30 minutes
               </p>
             </div>
           ) : (
             <div className="space-y-3">
-              {shuttleOptions.map((opt, index) => {
-                const isSelected =
-                  selectedShuttle?.route.route_id === opt.route.route_id;
+              {visibleOptions.map((opt, index) => {
+                const isSelected = selectedShuttle?.route.route_id === opt.route.route_id;
 
                 return (
                   <motion.button
@@ -497,9 +572,7 @@ export function ShuttleSelectionScreen() {
                     style={{
                       borderLeftColor: opt.route.route_color,
                       borderLeftWidth: 4,
-                      borderColor: isSelected
-                        ? opt.route.route_color
-                        : "#f3f4f6",
+                      borderColor: isSelected ? opt.route.route_color : "#f3f4f6",
                       boxShadow: isSelected
                         ? `0 0 0 2px ${opt.route.route_color}40, 0 8px 16px -4px ${opt.route.route_color}30`
                         : "0 1px 3px 0 rgb(0 0 0 / 0.1)",
@@ -507,17 +580,11 @@ export function ShuttleSelectionScreen() {
                   >
                     <div className="flex items-center justify-between">
                       <div>
-                        <div className="mb-1 font-medium">
-                          {opt.route.route_name}
-                        </div>
+                        <div className="mb-1 font-medium">{opt.route.route_name}</div>
                         <div className="flex items-center gap-4 text-sm text-gray-600">
                           <div className="flex items-center gap-1">
                             <Clock className="h-4 w-4" />
-                            <span>
-                              {opt.eta
-                                ? `Arrives in ${opt.eta}`
-                                : "Active"}
-                            </span>
+                            <span>{renderEtaLabel(opt)}</span>
                           </div>
                         </div>
                       </div>
@@ -536,9 +603,7 @@ export function ShuttleSelectionScreen() {
                   animate={{ y: 0, opacity: 1 }}
                   onClick={handleConfirm}
                   className="mt-4 w-full cursor-pointer rounded-2xl p-4 font-medium text-white shadow-md transition-all hover:shadow-lg"
-                  style={{
-                    backgroundColor: selectedShuttle.route.route_color,
-                  }}
+                  style={{ backgroundColor: selectedShuttle.route.route_color }}
                 >
                   Track {selectedShuttle.route.route_name}
                 </motion.button>

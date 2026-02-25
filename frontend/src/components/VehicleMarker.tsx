@@ -7,6 +7,7 @@ interface VehicleMarkerProps {
   lat: number;
   color: string;
   bearing?: number | null;
+  pulsing?: boolean;
 }
 
 export function VehicleMarker({
@@ -15,19 +16,49 @@ export function VehicleMarker({
   lat,
   color,
   bearing,
+  pulsing,
 }: VehicleMarkerProps) {
   const markerRef = useRef<mapboxgl.Marker | null>(null);
 
   useEffect(() => {
     const size = 36;
     const arrowSize = 10;
-    // Bearing determines arrow direction; default to 0 (north)
     const rotation = bearing ?? 0;
+
+    const wrapper = document.createElement("div");
+    wrapper.style.cssText = "position:relative;display:flex;align-items:center;justify-content:center;";
+
+    if (pulsing) {
+      // Inject keyframes if not already present
+      const styleId = "vehicle-pulse-keyframes";
+      if (!document.getElementById(styleId)) {
+        const style = document.createElement("style");
+        style.id = styleId;
+        style.textContent = `
+          @keyframes vehicle-pulse {
+            0%   { transform: scale(1);   opacity: 0.7; }
+            100% { transform: scale(2.4); opacity: 0; }
+          }
+        `;
+        document.head.appendChild(style);
+      }
+
+      const ring = document.createElement("div");
+      ring.style.cssText = `
+        position:absolute;
+        width:${size + arrowSize * 2}px;
+        height:${size + arrowSize * 2}px;
+        border-radius:50%;
+        border:3px solid ${color};
+        animation: vehicle-pulse 1.4s ease-out infinite;
+        pointer-events:none;
+      `;
+      wrapper.appendChild(ring);
+    }
 
     const el = document.createElement("div");
     el.style.cssText = `width:${size + arrowSize * 2}px;height:${size + arrowSize * 2}px;position:relative;`;
 
-    // SVG with circle + blended arrow + bus icon
     el.innerHTML = `
       <svg width="${size + arrowSize * 2}" height="${size + arrowSize * 2}" viewBox="0 0 ${size + arrowSize * 2} ${size + arrowSize * 2}" style="transform:rotate(${rotation}deg);filter:drop-shadow(0 2px 4px rgba(0,0,0,0.3));">
         <!-- Arrow pointing in bearing direction -->
@@ -54,7 +85,9 @@ export function VehicleMarker({
       </svg>
     `;
 
-    const marker = new mapboxgl.Marker({ element: el, anchor: "center" })
+    wrapper.appendChild(el);
+
+    const marker = new mapboxgl.Marker({ element: wrapper, anchor: "center" })
       .setLngLat([lng, lat])
       .addTo(map);
 
@@ -63,7 +96,7 @@ export function VehicleMarker({
     return () => {
       marker.remove();
     };
-  }, [map, lng, lat, color, bearing]);
+  }, [map, lng, lat, color, bearing, pulsing]);
 
   return null;
 }

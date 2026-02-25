@@ -6,12 +6,13 @@ import { VehicleMarker } from "../VehicleMarker";
 import { RouteTrail } from "../RouteTrail";
 import { BottomSheet } from "../BottomSheet";
 import { Bus, ChevronLeft, Clock, List } from "lucide-react";
-import { motion } from "motion/react";
+import { motion, AnimatePresence } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
   nearestPointOnLine,
   clipLineSegment,
   lineLength,
+  haversineDistance,
 } from "../../utils/geo";
 
 interface Vehicle {
@@ -35,7 +36,106 @@ interface TimelineStop {
   arrival_delay: number | null;
 }
 
+interface NextDeparture {
+  trip_id: string;
+  departure_unix: number;
+  departure_display: string;
+}
+
+type BusState =
+  | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
+  | { type: "dwelling"; vehicle: Vehicle; leavingInMinutes: number | null }
+  | { type: "departed"; vehicle: Vehicle | null; nextDepartures: NextDeparture[] }
+  | { type: "no-data"; nextDepartures: NextDeparture[] };
+
 const AVG_SPEED_MPS = 5.4;
+const DWELL_DISTANCE_M = 100;
+const BLEND_MIN_SPEED_MPS = 1.0;
+/** Show vehicle icon up to this many meters past origin before hiding it */
+const DEPARTED_SHOW_DISTANCE_M = 500;
+
+function detectBusState(
+  vehicles: Vehicle[],
+  originStop: { lat: number; lon: number },
+  routeCoords: [number, number][]
+): BusState {
+  if (vehicles.length === 0) {
+    return { type: "no-data", nextDepartures: [] };
+  }
+
+  const originLngLat: [number, number] = [originStop.lon, originStop.lat];
+
+  // Check if any vehicle is dwelling
+  for (const v of vehicles) {
+    const dist = haversineDistance([v.lon, v.lat], originLngLat);
+    if (dist <= DWELL_DISTANCE_M) {
+      return { type: "dwelling", vehicle: v, leavingInMinutes: null };
+    }
+  }
+
+  if (routeCoords.length >= 2) {
+    const originProj = nearestPointOnLine(routeCoords, originLngLat);
+
+    let bestEta = Infinity;
+    let bestVehicle: Vehicle | null = null;
+    let bestTrail: [number, number][] = [];
+
+    // Check for vehicles approaching (before origin)
+    for (const v of vehicles) {
+      const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
+      if (
+        vProj.segIndex > originProj.segIndex ||
+        (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
+      ) {
+        continue;
+      }
+
+      const trail = clipLineSegment(
+        routeCoords,
+        vProj.segIndex,
+        vProj.projPoint,
+        originProj.segIndex,
+        originProj.projPoint
+      );
+      if (trail.length < 2) continue;
+
+      const dist = lineLength(trail);
+      const speed = (v.speed ?? 0) > BLEND_MIN_SPEED_MPS ? v.speed! : AVG_SPEED_MPS;
+      const eta = Math.max(1, Math.round(dist / speed / 60));
+
+      if (eta < bestEta) {
+        bestEta = eta;
+        bestVehicle = v;
+        bestTrail = trail;
+      }
+    }
+
+    if (bestVehicle) {
+      return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
+    }
+
+    // All vehicles are past the origin — find the most recently departed one
+    // (closest to origin along route, but past it)
+    let closestPastVehicle: Vehicle | null = null;
+    let closestPastDist = Infinity;
+
+    for (const v of vehicles) {
+      const dist = haversineDistance([v.lon, v.lat], originLngLat);
+      const vProj = nearestPointOnLine(routeCoords, [v.lon, v.lat]);
+      const isPast =
+        vProj.segIndex > originProj.segIndex ||
+        (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t);
+      if (isPast && dist < closestPastDist) {
+        closestPastDist = dist;
+        closestPastVehicle = v;
+      }
+    }
+
+    return { type: "departed", vehicle: closestPastVehicle, nextDepartures: [] };
+  }
+
+  return { type: "departed", vehicle: null, nextDepartures: [] };
+}
 
 export function TrackingPreBoardScreen() {
   const navigate = useNavigate();
@@ -46,25 +146,12 @@ export function TrackingPreBoardScreen() {
     stateData.origin || sessionStorage.getItem("shuttle_origin") || "";
   const destination =
     stateData.destination || sessionStorage.getItem("shuttle_destination") || "";
-  const shuttle = stateData.shuttle || {
-    name: "",
-    color: "#1E90FF",
-    route_id: "",
-  };
+  const shuttle = stateData.shuttle || { name: "", color: "#1E90FF", route_id: "" };
 
-  const [vehicle, setVehicle] = useState<Vehicle | null>(null);
+  const [busState, setBusState] = useState<BusState | null>(null);
   const [routeCoords, setRouteCoords] = useState<[number, number][]>([]);
-  const [originStop, setOriginStop] = useState<{
-    id: string;
-    lat: number;
-    lon: number;
-  } | null>(null);
-  const [destStop, setDestStop] = useState<{
-    id: string;
-    lat: number;
-    lon: number;
-  } | null>(null);
-  const [etaMinutes, setEtaMinutes] = useState<number | null>(null);
+  const [originStop, setOriginStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
+  const [destStop, setDestStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
   const [timeline, setTimeline] = useState<TimelineStop[]>([]);
   const [showTimeline, setShowTimeline] = useState(false);
   const [mapInstance, setMapInstance] = useState<mapboxgl.Map | null>(null);
@@ -77,7 +164,33 @@ export function TrackingPreBoardScreen() {
     }
   }, []);
 
-  // Load route data, find nearest vehicle, get ETA + timeline
+  const fetchNextDepartures = async (routeId: string, stopId: string): Promise<NextDeparture[]> => {
+    try {
+      const url = `/api/next-departures?route_id=${encodeURIComponent(routeId)}&stop_id=${encodeURIComponent(stopId)}&limit=3`;
+      const res = await fetch(url);
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.departures || [];
+    } catch {
+      return [];
+    }
+  };
+
+  /** Scheduled departure from stop_times.txt for this specific vehicle trip at this stop. */
+  const fetchScheduledDeparture = async (tripId: string, stopId: string): Promise<number | null> => {
+    try {
+      const res = await fetch(
+        `/api/scheduled-arrival?trip_id=${encodeURIComponent(tripId)}&stop_id=${encodeURIComponent(stopId)}`
+      );
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.departure_unix ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Initial load
   useEffect(() => {
     if (!shuttle.route_id) return;
 
@@ -105,12 +218,9 @@ export function TrackingPreBoardScreen() {
           if (features && features.length > 0) {
             coords = features[0].geometry.coordinates;
           }
-        } catch {
-          /* no geojson */
-        }
+        } catch { /* no geojson */ }
         setRouteCoords(coords);
 
-        // Find origin and destination stops
         const oStop = stops.find(
           (s: { name: string; id: string; lat: number; lon: number }) =>
             s.name.toLowerCase().includes(origin.toLowerCase()) ||
@@ -125,85 +235,45 @@ export function TrackingPreBoardScreen() {
         if (oStop) setOriginStop({ id: oStop.id, lat: oStop.lat, lon: oStop.lon });
         if (dStop) setDestStop({ id: dStop.id, lat: dStop.lat, lon: dStop.lon });
 
-        // Find nearest vehicle approaching origin
         const vehicles: Vehicle[] = vehiclesData.vehicles || [];
-        let bestVehicle: Vehicle | null = null;
-        let bestDist = Infinity;
 
-        if (oStop && coords.length >= 2) {
-          const originProj = nearestPointOnLine(coords, [oStop.lon, oStop.lat]);
-          for (const v of vehicles) {
-            const vProj = nearestPointOnLine(coords, [v.lon, v.lat]);
-            if (
-              vProj.segIndex < originProj.segIndex ||
-              (vProj.segIndex === originProj.segIndex &&
-                vProj.t <= originProj.t)
-            ) {
-              const trail = clipLineSegment(
-                coords,
-                vProj.segIndex,
-                vProj.projPoint,
-                originProj.segIndex,
-                originProj.projPoint
-              );
-              const dist = lineLength(trail);
-              if (dist < bestDist) {
-                bestDist = dist;
-                bestVehicle = v;
-              }
-            }
-          }
-        }
-
-        // Fallback: use first vehicle if none found approaching
-        if (!bestVehicle && vehicles.length > 0) {
-          bestVehicle = vehicles[0];
-        }
-        setVehicle(bestVehicle);
-
-        // Get ETA
+        let state: BusState;
         if (oStop) {
-          try {
-            const etaRes = await fetch(`/api/eta?stop_id=${oStop.id}`, { signal });
-            if (!etaRes.ok) throw new Error(`ETA HTTP ${etaRes.status}`);
-            const etaData = await etaRes.json();
-            const routeEta = etaData.etas?.find(
-              (e: { route_id: string }) =>
-                String(e.route_id) === String(shuttle.route_id)
-            );
-            if (routeEta?.arrival_time) {
-              const now = Math.floor(Date.now() / 1000);
-              setEtaMinutes(
-                Math.max(0, Math.round((routeEta.arrival_time - now) / 60))
-              );
-            } else if (bestDist < Infinity) {
-              setEtaMinutes(
-                Math.max(1, Math.round(bestDist / AVG_SPEED_MPS / 60))
-              );
-            }
-          } catch {
-            if (bestDist < Infinity) {
-              setEtaMinutes(
-                Math.max(1, Math.round(bestDist / AVG_SPEED_MPS / 60))
-              );
-            }
+          const raw = detectBusState(vehicles, oStop, coords);
+          if (raw.type === "dwelling") {
+            const depUnix = await fetchScheduledDeparture(raw.vehicle.trip_id, oStop.id);
+            const leavingIn = depUnix != null
+              ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
+              : null;
+            state = { type: "dwelling", vehicle: raw.vehicle, leavingInMinutes: leavingIn };
+          } else if (raw.type === "departed" || raw.type === "no-data") {
+            const nextDeps = await fetchNextDepartures(shuttle.route_id, oStop.id);
+            state = { ...raw, nextDepartures: nextDeps } as BusState;
+          } else {
+            state = raw;
           }
+        } else {
+          state = { type: "no-data", nextDepartures: [] };
         }
+        setBusState(state);
 
-        // Get trip timeline
-        if (bestVehicle?.trip_id) {
+        // Load timeline for approaching vehicle
+        const trackingVehicle =
+          state.type === "arriving" ? state.vehicle :
+          state.type === "dwelling" ? state.vehicle :
+          (state.type === "departed" ? state.vehicle : null);
+
+        if (trackingVehicle?.trip_id) {
           try {
             const tlRes = await fetch(
-              `/api/trip-timeline?trip_id=${encodeURIComponent(bestVehicle.trip_id)}`,
+              `/api/trip-timeline?trip_id=${encodeURIComponent(trackingVehicle.trip_id)}`,
               { signal }
             );
             if (tlRes.ok) {
               const tlData = await tlRes.json();
               setTimeline(tlData.stops || []);
             }
-          } catch {
-            /* timeline unavailable */
-          }
+          } catch { /* timeline unavailable */ }
         }
       } catch (e) {
         if (e instanceof Error && e.name !== "AbortError") {
@@ -224,129 +294,94 @@ export function TrackingPreBoardScreen() {
     const bounds = new mapboxgl.LngLatBounds();
     bounds.extend([originStop.lon, originStop.lat]);
     bounds.extend([destStop.lon, destStop.lat]);
+    const vehicle =
+      busState?.type === "arriving" ? busState.vehicle :
+      busState?.type === "dwelling" ? busState.vehicle :
+      busState?.type === "departed" ? busState.vehicle : null;
     if (vehicle) bounds.extend([vehicle.lon, vehicle.lat]);
     mapInstance.fitBounds(bounds, {
       padding: { top: 80, bottom: 420, left: 60, right: 60 },
       maxZoom: 16,
     });
-  }, [mapInstance, originStop, destStop, vehicle]);
+  }, [mapInstance, originStop, destStop]);
 
-  // Keep routeCoords in a ref so polling doesn't restart when coords load
+  // Keep refs for polling
   const routeCoordsRef = useRef(routeCoords);
   routeCoordsRef.current = routeCoords;
+  const originStopRef = useRef(originStop);
+  originStopRef.current = originStop;
 
-  // Poll vehicle + ETA every 5s
+  // Poll every 5s — pure position-based, no /api/eta
   useEffect(() => {
-    if (!vehicle || !originStop) return;
+    if (!busState || !originStop) return;
 
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(
-          `/api/vehicles?route=${encodeURIComponent(shuttle.name)}`
-        );
+        const res = await fetch(`/api/vehicles?route=${encodeURIComponent(shuttle.name)}`);
         if (!res.ok) return;
         const data = await res.json();
         const vehicles: Vehicle[] = data.vehicles || [];
         const coords = routeCoordsRef.current;
+        const oStop = originStopRef.current;
+        if (!oStop) return;
 
-        // Try to find the same vehicle by id
-        const same = vehicles.find((v) => v.id === vehicle.id);
-        if (same) {
-          setVehicle(same);
-        } else if (vehicles.length > 0 && coords.length >= 2) {
-          // Find nearest approaching vehicle
-          const originProj = nearestPointOnLine(coords, [
-            originStop.lon,
-            originStop.lat,
-          ]);
-          let best: Vehicle | null = null;
-          let bestD = Infinity;
-          for (const v of vehicles) {
-            const vProj = nearestPointOnLine(coords, [v.lon, v.lat]);
-            if (
-              vProj.segIndex < originProj.segIndex ||
-              (vProj.segIndex === originProj.segIndex &&
-                vProj.t <= originProj.t)
-            ) {
-              const t = clipLineSegment(
-                coords,
-                vProj.segIndex,
-                vProj.projPoint,
-                originProj.segIndex,
-                originProj.projPoint
-              );
-              const d = lineLength(t);
-              if (d < bestD) {
-                bestD = d;
-                best = v;
-              }
-            }
-          }
-          if (best) setVehicle(best);
+        const raw = detectBusState(vehicles, oStop, coords);
+        let state: BusState;
+
+        if (raw.type === "dwelling") {
+          const depUnix = await fetchScheduledDeparture(raw.vehicle.trip_id, oStop.id);
+          const leavingIn = depUnix != null
+            ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
+            : null;
+          state = { type: "dwelling", vehicle: raw.vehicle, leavingInMinutes: leavingIn };
+        } else if (raw.type === "departed" || raw.type === "no-data") {
+          const nextDeps = await fetchNextDepartures(shuttle.route_id, oStop.id);
+          state = { ...raw, nextDepartures: nextDeps } as BusState;
+        } else {
+          state = raw;
         }
 
-        // Refresh ETA
-        const etaRes = await fetch(`/api/eta?stop_id=${originStop.id}`);
-        if (etaRes.ok) {
-          const etaData = await etaRes.json();
-          const routeEta = etaData.etas?.find(
-            (e: { route_id: string }) =>
-              String(e.route_id) === String(shuttle.route_id)
-          );
-          if (routeEta?.arrival_time) {
-            const now = Math.floor(Date.now() / 1000);
-            setEtaMinutes(
-              Math.max(0, Math.round((routeEta.arrival_time - now) / 60))
-            );
-          }
-        }
-      } catch {
-        /* poll failed, keep current state */
-      }
+        setBusState(state);
+      } catch { /* keep current state */ }
     }, 5000);
 
     return () => clearInterval(interval);
-  }, [vehicle?.id, originStop, shuttle.name, shuttle.route_id]);
+  }, [!!busState, !!originStop, shuttle.name, shuttle.route_id]);
 
-  // Compute trail from vehicle to origin
+  // Derive trail from busState
   const trail = useMemo(() => {
-    if (!vehicle || !originStop || routeCoords.length < 2) return null;
+    if (busState?.type === "arriving") return busState.trail;
+    return null;
+  }, [busState]);
 
-    const originProj = nearestPointOnLine(routeCoords, [
-      originStop.lon,
-      originStop.lat,
-    ]);
-    const vProj = nearestPointOnLine(routeCoords, [vehicle.lon, vehicle.lat]);
-
-    if (
-      vProj.segIndex > originProj.segIndex ||
-      (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
-    ) {
-      return null;
-    }
-
-    const coords = clipLineSegment(
-      routeCoords,
-      vProj.segIndex,
-      vProj.projPoint,
-      originProj.segIndex,
-      originProj.projPoint
+  // Determine whether to show the vehicle on the map when departed
+  const showDepartedVehicle = useMemo(() => {
+    if (busState?.type !== "departed" || !busState.vehicle || !originStop) return false;
+    const dist = haversineDistance(
+      [busState.vehicle.lon, busState.vehicle.lat],
+      [originStop.lon, originStop.lat]
     );
-    return coords.length >= 2 ? coords : null;
-  }, [vehicle, originStop, routeCoords]);
+    return dist <= DEPARTED_SHOW_DISTANCE_M;
+  }, [busState, originStop]);
 
-  // Filter timeline: from vehicle's current stop onward
+  const activeVehicle = useMemo(() => {
+    if (!busState) return null;
+    if (busState.type === "arriving") return busState.vehicle;
+    if (busState.type === "dwelling") return busState.vehicle;
+    if (busState.type === "departed" && showDepartedVehicle) return busState.vehicle;
+    return null;
+  }, [busState, showDepartedVehicle]);
+
+  // Filter timeline
   const visibleTimeline = useMemo(() => {
-    if (timeline.length === 0 || !vehicle) return timeline;
-    const vehicleSeq = vehicle.current_stop_sequence;
+    if (timeline.length === 0 || !activeVehicle) return timeline;
+    const vehicleSeq = activeVehicle.current_stop_sequence;
     if (vehicleSeq == null) return timeline;
     return timeline.filter((s) => s.stop_sequence >= vehicleSeq);
-  }, [timeline, vehicle]);
+  }, [timeline, activeVehicle]);
 
   const handleBoardShuttle = () => {
-    navigate("/tracking-on-board", {
-      state: { origin, destination, shuttle },
-    });
+    navigate("/tracking-on-board", { state: { origin, destination, shuttle } });
   };
 
   const formatTime = (unixTime: number | null): string => {
@@ -366,6 +401,8 @@ export function TrackingPreBoardScreen() {
       </div>
     );
   }
+
+  const isDeparted = busState?.type === "departed";
 
   return (
     <div className="relative mx-auto h-[100dvh] w-full max-w-[430px] overflow-hidden bg-white">
@@ -407,13 +444,14 @@ export function TrackingPreBoardScreen() {
             )}
 
             {/* Vehicle marker */}
-            {vehicle && (
+            {activeVehicle && (
               <VehicleMarker
                 map={map}
-                lng={vehicle.lon}
-                lat={vehicle.lat}
+                lng={activeVehicle.lon}
+                lat={activeVehicle.lat}
                 color={shuttle.color}
-                bearing={vehicle.bearing}
+                bearing={activeVehicle.bearing}
+                pulsing={busState?.type === "dwelling"}
               />
             )}
           </>
@@ -427,6 +465,40 @@ export function TrackingPreBoardScreen() {
       >
         <ChevronLeft className="h-5 w-5 text-gray-700" />
       </button>
+
+      {/* Departed overlay/toast */}
+      <AnimatePresence>
+        {isDeparted && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="absolute left-4 right-4 top-24 z-40 rounded-2xl bg-white p-4 shadow-xl"
+            style={{ borderLeft: `4px solid ${shuttle.color}` }}
+          >
+            <div className="mb-1 font-medium text-gray-900">Your shuttle has left.</div>
+            <div className="mb-3 text-sm text-gray-500">
+              Check available shuttles for the next one.
+            </div>
+            {busState?.type === "departed" && busState.nextDepartures.length > 0 && (
+              <div className="mb-3 text-sm text-gray-700">
+                Next departure: <span className="font-medium">{busState.nextDepartures[0].departure_display}</span>
+              </div>
+            )}
+            <button
+              onClick={() =>
+                navigate("/shuttle-selection", {
+                  state: { origin, destination },
+                })
+              }
+              className="w-full cursor-pointer rounded-xl py-2 font-medium text-white"
+              style={{ backgroundColor: shuttle.color }}
+            >
+              Go Back
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Bottom sheet */}
       <BottomSheet height="auto">
@@ -445,25 +517,54 @@ export function TrackingPreBoardScreen() {
             </div>
           </div>
 
-          {/* Arriving card */}
-          <motion.div
-            initial={{ scale: 0.95 }}
-            animate={{ scale: 1 }}
-            transition={{
-              repeat: Infinity,
-              repeatType: "reverse",
-              duration: 1.5,
-            }}
-            className="mb-6 rounded-2xl bg-blue-50 p-4 text-center"
-          >
-            <div className="mb-1 text-3xl">🚌</div>
-            <div className="text-lg font-medium">
-              {etaMinutes != null
-                ? `Arriving in ${etaMinutes} min`
-                : "Shuttle approaching"}
+          {/* Status card */}
+          {busState?.type === "arriving" && (
+            <motion.div
+              initial={{ scale: 0.95 }}
+              animate={{ scale: 1 }}
+              transition={{ repeat: Infinity, repeatType: "reverse", duration: 1.5 }}
+              className="mb-6 rounded-2xl bg-blue-50 p-4 text-center"
+            >
+              <div className="mb-1 text-3xl">🚌</div>
+              <div className="text-lg font-medium">
+                Arriving in {busState.etaMinutes} min
+              </div>
+              <div className="mt-1 text-sm text-gray-600">At {origin}</div>
+            </motion.div>
+          )}
+
+          {busState?.type === "dwelling" && (
+            <motion.div
+              initial={{ scale: 0.95 }}
+              animate={{ scale: 1 }}
+              transition={{ repeat: Infinity, repeatType: "reverse", duration: 1.5 }}
+              className="mb-6 rounded-2xl p-4 text-center"
+              style={{ backgroundColor: `${shuttle.color}15` }}
+            >
+              <div className="mb-1 text-3xl">🚌</div>
+              <div className="text-lg font-medium" style={{ color: shuttle.color }}>
+                {busState.leavingInMinutes === 0 ? "Departing now" : "At your stop now"}
+              </div>
+              {busState.leavingInMinutes != null && busState.leavingInMinutes > 0 && busState.leavingInMinutes <= 20 && (
+                <div className="mt-0.5 text-sm font-medium" style={{ color: shuttle.color }}>
+                  Leaving in ~{busState.leavingInMinutes} min
+                </div>
+              )}
+              <div className="mt-1 text-sm text-gray-600">At {origin}</div>
+            </motion.div>
+          )}
+
+          {(busState?.type === "departed" || busState?.type === "no-data") && (
+            <div className="mb-6 rounded-2xl bg-gray-50 p-4 text-center">
+              <div className="mb-1 text-3xl">🕐</div>
+              <div className="text-lg font-medium text-gray-700">
+                {busState.nextDepartures.length > 0
+                  ? `Next at ${busState.nextDepartures[0].departure_display}`
+                  : "No upcoming departures"}
+              </div>
+              <div className="mt-1 text-sm text-gray-600">At {origin}</div>
             </div>
-            <div className="mt-1 text-sm text-gray-600">At {origin}</div>
-          </motion.div>
+          )}
 
           {/* Timeline toggle */}
           {!showTimeline && visibleTimeline.length > 0 && (
@@ -484,9 +585,7 @@ export function TrackingPreBoardScreen() {
               className="mb-6"
             >
               <div className="mb-3 flex items-center justify-between">
-                <div className="text-sm font-medium text-gray-500">
-                  Route timeline
-                </div>
+                <div className="text-sm font-medium text-gray-500">Route timeline</div>
                 <button
                   onClick={() => setShowTimeline(false)}
                   className="cursor-pointer text-sm text-gray-500 hover:text-gray-700"
@@ -496,21 +595,15 @@ export function TrackingPreBoardScreen() {
               </div>
 
               <div className="relative">
-                {/* Vertical line */}
                 <div
                   className="absolute bottom-0 left-[11px] top-0 w-0.5"
                   style={{ backgroundColor: `${shuttle.color}30` }}
                 />
-
                 <div className="space-y-0">
                   {visibleTimeline.map((stop, index) => {
                     const isOrigin =
-                      stop.stop_name
-                        .toLowerCase()
-                        .includes(origin.toLowerCase()) ||
-                      origin
-                        .toLowerCase()
-                        .includes(stop.stop_name.toLowerCase());
+                      stop.stop_name.toLowerCase().includes(origin.toLowerCase()) ||
+                      origin.toLowerCase().includes(stop.stop_name.toLowerCase());
                     const isFirst = index === 0;
                     const isDelayed =
                       stop.arrival_delay != null && stop.arrival_delay > 60;
@@ -524,19 +617,13 @@ export function TrackingPreBoardScreen() {
                         className="relative pb-6 last:pb-0"
                       >
                         <div
-                          className={`-ml-3 flex items-start gap-4 rounded-xl p-3 transition-colors ${
-                            isOrigin ? "border-2" : ""
-                          }`}
+                          className={`-ml-3 flex items-start gap-4 rounded-xl p-3 transition-colors ${isOrigin ? "border-2" : ""}`}
                           style={
                             isOrigin
-                              ? {
-                                  borderColor: shuttle.color,
-                                  backgroundColor: `${shuttle.color}10`,
-                                }
+                              ? { borderColor: shuttle.color, backgroundColor: `${shuttle.color}10` }
                               : {}
                           }
                         >
-                          {/* Stop indicator */}
                           <div className="relative z-10 shrink-0">
                             {isFirst ? (
                               <div
@@ -560,27 +647,18 @@ export function TrackingPreBoardScreen() {
                             )}
                           </div>
 
-                          {/* Stop info */}
                           <div className="flex-1 pt-0.5">
-                            <div className="font-medium text-gray-900">
-                              {stop.stop_name}
-                            </div>
+                            <div className="font-medium text-gray-900">{stop.stop_name}</div>
                             {isFirst && (
-                              <div className="text-sm text-gray-500">
-                                Shuttle is here now
-                              </div>
+                              <div className="text-sm text-gray-500">Shuttle is here now</div>
                             )}
                             {isOrigin && !isFirst && (
-                              <div
-                                className="text-sm"
-                                style={{ color: shuttle.color }}
-                              >
+                              <div className="text-sm" style={{ color: shuttle.color }}>
                                 Your location
                               </div>
                             )}
                           </div>
 
-                          {/* Time */}
                           <div className="pt-0.5 text-right">
                             {stop.predicted_arrival ? (
                               isDelayed ? (
@@ -592,22 +670,16 @@ export function TrackingPreBoardScreen() {
                                   )}
                                   <div className="flex items-center gap-1 text-sm font-medium text-red-600">
                                     <Clock className="h-4 w-4" />
-                                    <span>
-                                      {formatTime(stop.predicted_arrival)}
-                                    </span>
+                                    <span>{formatTime(stop.predicted_arrival)}</span>
                                   </div>
                                 </div>
                               ) : (
                                 <div
                                   className="flex items-center gap-1 text-sm font-medium"
-                                  style={{
-                                    color: isFirst ? shuttle.color : "#6B7280",
-                                  }}
+                                  style={{ color: isFirst ? shuttle.color : "#6B7280" }}
                                 >
                                   <Clock className="h-4 w-4" />
-                                  <span>
-                                    {formatTime(stop.predicted_arrival)}
-                                  </span>
+                                  <span>{formatTime(stop.predicted_arrival)}</span>
                                 </div>
                               )
                             ) : stop.scheduled_arrival ? (

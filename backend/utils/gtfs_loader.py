@@ -1,6 +1,8 @@
 import csv
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from datetime import date
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GTFS_DIR = os.path.join(BASE_DIR, "data", "google_transit")
@@ -12,6 +14,8 @@ route_id_by_trip_id: Dict[str, str] = {}
 stop_row_by_stop_id: Dict[str, Dict[str, Any]] = {}
 shape_points_by_shape_id: Dict[str, List[Dict[str, str]]] = {}
 stop_times_by_trip_id: Dict[str, List[Dict[str, str]]] = {}
+calendar_by_service_id: Dict[str, Dict] = {}       # service_id → calendar row
+calendar_exceptions: Dict[str, List[Dict]] = {}    # service_id → [{date, exception_type}]
 
 
 def read_gtfs_csv(filename: str) -> List[Dict[str, str]]:
@@ -44,9 +48,50 @@ def normalize_gtfs_hex_color(raw_color: Optional[str], default_color: str = "#1E
     return color
 
 
+def get_active_service_ids(target_date: date) -> Set[str]:
+    """Return service_ids that run on target_date, applying calendar + calendar_dates."""
+    day_name = target_date.strftime("%A").lower()  # e.g. "monday"
+    date_str = target_date.strftime("%Y%m%d")
+
+    active: Set[str] = set()
+
+    for service_id, row in calendar_by_service_id.items():
+        start = row.get("start_date", "")
+        end = row.get("end_date", "")
+        if start <= date_str <= end and row.get(day_name, "0") == "1":
+            active.add(service_id)
+
+    # Apply exceptions from calendar_dates.txt
+    for service_id, exceptions in calendar_exceptions.items():
+        for exc in exceptions:
+            if exc["date"] == date_str:
+                if exc["exception_type"] == "1":
+                    active.add(service_id)
+                elif exc["exception_type"] == "2":
+                    active.discard(service_id)
+
+    return active
+
+
+def gtfs_time_to_today_unix(gtfs_time_str: str) -> int:
+    """Convert HH:MM:SS (GTFS, can exceed 24h) to Unix timestamp for today."""
+    parts = gtfs_time_str.strip().split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid GTFS time: {gtfs_time_str}")
+    h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+
+    # Get start of today (midnight) in local time
+    import datetime
+    today = datetime.date.today()
+    midnight = datetime.datetime(today.year, today.month, today.day, 0, 0, 0)
+    midnight_unix = int(midnight.timestamp())
+    return midnight_unix + h * 3600 + m * 60 + s
+
+
 def build_static_gtfs_indices() -> None:
     global route_lookup_by_name, trips_grouped_by_route_id, route_id_by_trip_id, \
-        stop_row_by_stop_id, shape_points_by_shape_id, stop_times_by_trip_id
+        stop_row_by_stop_id, shape_points_by_shape_id, stop_times_by_trip_id, \
+        calendar_by_service_id, calendar_exceptions
 
     routes_rows = read_gtfs_csv("routes.txt")
     stops_rows = read_gtfs_csv("stops.txt")
@@ -83,6 +128,27 @@ def build_static_gtfs_indices() -> None:
         if not trip_id:
             continue
         stop_times_by_trip_id.setdefault(trip_id, []).append(stop_time_row)
+
+    # calendar lookup
+    calendar_by_service_id = {}
+    calendar_path = os.path.join(GTFS_DIR, "calendar.txt")
+    if os.path.exists(calendar_path):
+        for row in read_gtfs_csv("calendar.txt"):
+            service_id = row.get("service_id")
+            if service_id:
+                calendar_by_service_id[service_id] = row
+
+    # calendar_dates lookup
+    calendar_exceptions = {}
+    calendar_dates_path = os.path.join(GTFS_DIR, "calendar_dates.txt")
+    if os.path.exists(calendar_dates_path):
+        for row in read_gtfs_csv("calendar_dates.txt"):
+            service_id = row.get("service_id")
+            if service_id:
+                calendar_exceptions.setdefault(service_id, []).append({
+                    "date": row.get("date", ""),
+                    "exception_type": row.get("exception_type", ""),
+                })
 
     # shapes lookup
     shape_points_by_shape_id = {}
