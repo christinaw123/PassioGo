@@ -57,6 +57,27 @@ interface ShuttleOption {
   precomputed: PrecomputedRoute | null;
 }
 
+// ─── Layout knobs ────────────────────────────────────────────────────────────
+/** Corner radius of each shuttle option card, in px */
+const SHUTTLE_CARD_RADIUS = 16;       // try: 8  12  16  20  24
+/** Padding inside each shuttle option card, in px */
+const SHUTTLE_CARD_PADDING = 12;      // try: 12  16  20  24
+/** Vertical gap between shuttle option cards, in px */
+const SHUTTLE_CARD_GAP = 12;          // try: 6  8  12  16
+/** Gap between the route name/eta block and the color dot, in px */
+const SHUTTLE_ITEM_GAP = 16;          // try: 8  12  16  24
+/** Gap between the clock icon and the ETA text, in px */
+const SHUTTLE_ETA_ICON_GAP = 4;       // try: 2  4  6  8
+/** Corner radius of the "Track" confirm button, in px */
+const SHUTTLE_BTN_RADIUS = 16;        // try: 8  12  16  20  24
+/** Padding of the "Track" confirm button, in px */
+const SHUTTLE_BTN_PADDING = 12;       // try: 12  16  20
+/** Top margin above the "Available Shuttles" heading, in px */
+const HEADER_TOP_MARGIN =12;          // try: 4   8   12  16
+/** Bottom margin below the "From X to Y" subtitle (gap before cards), in px */
+const HEADER_SUBTITLE_MARGIN = 12;    // try: 12  16  20  24
+// ─────────────────────────────────────────────────────────────────────────────
+
 /** ~12 mph average shuttle speed in m/s */
 const AVG_SPEED_MPS = 5.4;
 const DWELL_DISTANCE_M = 50;
@@ -68,7 +89,11 @@ function detectBusState(
   originStop: { id: string; lat: number; lon: number },
   routeCoords: [number, number][],
   precomputed?: PrecomputedRoute
-): Omit<BusState, "leavingInMinutes" | "departureDisplay" | "nextDepartures"> & { nextDepartures?: NextDeparture[] } {
+):
+  | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
+  | { type: "dwelling"; vehicle: Vehicle }
+  | { type: "departed" | "no-data"; nextDepartures: NextDeparture[] }
+{
   if (vehicles.length === 0) return { type: "no-data", nextDepartures: [] };
 
   const originLngLat: [number, number] = [originStop.lon, originStop.lat];
@@ -322,7 +347,7 @@ export function ShuttleSelectionScreen() {
             if (oStop) {
               const raw = detectBusState(vehicles, oStop, routeCoords, precomputed ?? undefined);
               if (raw.type === "dwelling") {
-                const dwellingVehicle = (raw as { vehicle: Vehicle }).vehicle;
+                const dwellingVehicle = raw.vehicle;
                 const depUnix = await fetchScheduledDeparture(dwellingVehicle.trip_id, oStop.id);
                 const leavingIn = depUnix != null
                   ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
@@ -604,9 +629,9 @@ export function ShuttleSelectionScreen() {
 
       {/* Bottom sheet */}
       <BottomSheet height="45%">
-        <div className="mt-2">
+        <div style={{ marginTop: HEADER_TOP_MARGIN }}>
           <h2 className="mb-1 text-xl font-medium">Available Shuttles</h2>
-          <p className="mb-6 text-sm text-gray-500">
+          <p className="text-sm text-gray-500" style={{ marginBottom: HEADER_SUBTITLE_MARGIN }}>
             From {origin} to {destination}
           </p>
 
@@ -622,7 +647,7 @@ export function ShuttleSelectionScreen() {
               </p>
             </div>
           ) : (
-            <div className="space-y-3">
+            <div style={{ display: "flex", flexDirection: "column", gap: SHUTTLE_CARD_GAP }}>
               {visibleOptions.map((opt, index) => {
                 const isSelected = selectedShuttle?.route.route_id === opt.route.route_id;
 
@@ -637,29 +662,29 @@ export function ShuttleSelectionScreen() {
                     }}
                     transition={{ delay: index * 0.1 }}
                     onClick={() => setSelectedShuttle(opt)}
-                    className="w-full cursor-pointer rounded-2xl border-2 bg-white p-4 text-left transition-all hover:shadow-md"
+                    className="w-full cursor-pointer bg-white text-left transition-all hover:shadow-md"
                     style={{
-                      borderLeftColor: opt.route.route_color,
+                      borderRadius: SHUTTLE_CARD_RADIUS,
+                      padding: SHUTTLE_CARD_PADDING,
+                      borderLeft: `4px solid ${opt.route.route_color}`,
+                      border: isSelected ? `2px solid ${opt.route.route_color}` : "2px solid #f3f4f6",
                       borderLeftWidth: 4,
-                      borderColor: isSelected ? opt.route.route_color : "#f3f4f6",
                       boxShadow: isSelected
                         ? `0 0 0 2px ${opt.route.route_color}40, 0 8px 16px -4px ${opt.route.route_color}30`
                         : "0 1px 3px 0 rgb(0 0 0 / 0.1)",
                     }}
                   >
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between" style={{ gap: SHUTTLE_ITEM_GAP }}>
                       <div>
                         <div className="mb-1 font-medium">{opt.route.route_name}</div>
-                        <div className="flex items-center gap-4 text-sm text-gray-600">
-                          <div className="flex items-center gap-1">
-                            <Clock className="h-4 w-4" />
-                            <span>{renderEtaLabel(opt)}</span>
-                          </div>
+                        <div className="flex items-center text-sm text-gray-600" style={{ gap: SHUTTLE_ETA_ICON_GAP }}>
+                          <Clock className="h-4 w-4 shrink-0" />
+                          <span>{renderEtaLabel(opt)}</span>
                         </div>
                       </div>
                       <div
-                        className="h-3 w-3 rounded-full"
-                        style={{ backgroundColor: opt.route.route_color }}
+                        className="shrink-0 rounded-full"
+                        style={{ backgroundColor: opt.route.route_color, width: 12, height: 12 }}
                       />
                     </div>
                   </motion.button>
@@ -671,8 +696,12 @@ export function ShuttleSelectionScreen() {
                   initial={{ y: 20, opacity: 0 }}
                   animate={{ y: 0, opacity: 1 }}
                   onClick={handleConfirm}
-                  className="mt-4 w-full cursor-pointer rounded-2xl p-4 font-medium text-white shadow-md transition-all hover:shadow-lg"
-                  style={{ backgroundColor: selectedShuttle.route.route_color }}
+                  className="mt-4 w-full cursor-pointer font-medium text-white shadow-md transition-all hover:shadow-lg"
+                  style={{
+                    borderRadius: SHUTTLE_BTN_RADIUS,
+                    padding: SHUTTLE_BTN_PADDING,
+                    backgroundColor: selectedShuttle.route.route_color,
+                  }}
                 >
                   Track {selectedShuttle.route.route_name}
                 </motion.button>
