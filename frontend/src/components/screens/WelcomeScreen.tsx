@@ -6,6 +6,26 @@ import { Navigation, MapPin, Locate, X } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import mapboxgl from "mapbox-gl";
 
+// ─── Layout knobs — tweak these to adjust card appearance ───────────────────
+/** Horizontal padding from phone edges to each card, in px */
+const CARD_SIDE_PADDING = 16;       // try: 32  48  64  80  96  128
+/** Bottom padding so cards clear the home indicator, in px */
+const CARD_BOTTOM_PADDING = 24;     // try: 40  56  64  80  96
+/** Vertical gap between the two cards, in px */
+const CARD_GAP = 6;                 // try: 4   8   12  16  24
+/** Internal padding inside each card, in px (all sides) */
+const CARD_PADDING = 16;            // try: 12  16  20  24
+/** Card corner radius, in px */
+const CARD_RADIUS = 16;             // try: 12  16  20  24
+
+/** "Tap a stop on the map" pill — horizontal padding, in px */
+const PILL_PADDING_X = 12;          // try: 8   10  12  16
+/** "Tap a stop on the map" pill — vertical padding, in px */
+const PILL_PADDING_Y = 4;           // try: 2   4   6   8
+/** "Tap a stop on the map" pill corner radius, in px */
+const PILL_RADIUS = 32;            // try: 4   8   12  16  999 (full pill)
+// ─────────────────────────────────────────────────────────────────────────────
+
 interface Stop {
   id: string;
   name: string;
@@ -272,21 +292,24 @@ export function WelcomeScreen() {
       </Map>
 
       {/* Bottom section: locate button + input cards */}
-      <div className="pointer-events-none absolute bottom-0 left-0 right-0 px-8 pb-10">
+      <div
+        className="pointer-events-none absolute bottom-0 left-0 right-0"
+        style={{ paddingLeft: CARD_SIDE_PADDING, paddingRight: CARD_SIDE_PADDING, paddingBottom: CARD_BOTTOM_PADDING }}
+      >
         {/* Floating locate button — above the cards, right-aligned */}
-        <div className="mb-4 flex justify-end">
+        <div className="mb-3 flex justify-end">
           <motion.button
             initial={{ scale: 0, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
             transition={{ delay: 0.1, type: "spring" }}
             onClick={handleCurrentLocationClick}
-            className="pointer-events-auto flex h-12 w-12 cursor-pointer items-center justify-center rounded-full bg-white shadow-lg transition-all hover:bg-blue-50 hover:shadow-xl"
+            className="pointer-events-auto flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-blue-500 shadow-lg transition-colors hover:bg-blue-600"
           >
-            <Locate className="h-6 w-6 text-blue-600" />
+            <Locate className="h-5 w-5 text-white" />
           </motion.button>
         </div>
 
-        <div className="space-y-6">
+        <div style={{ display: "flex", flexDirection: "column", gap: CARD_GAP }}>
           {/* Origin card */}
           <motion.button
             initial={{ y: 20, opacity: 0 }}
@@ -297,22 +320,24 @@ export function WelcomeScreen() {
             }}
             transition={{ delay: 0.2 }}
             onClick={handleOriginCardClick}
-            className={`pointer-events-auto relative w-full cursor-pointer rounded-3xl bg-white px-5 py-5 text-left shadow-lg transition-shadow hover:shadow-xl ${
-              selectionMode === "origin"
-                ? "border-[2.5px] border-blue-500"
-                : "border border-gray-100"
-            }`}
+            className="pointer-events-auto relative w-full cursor-pointer bg-white text-left shadow-lg transition-shadow hover:shadow-xl"
+            style={{
+              borderRadius: CARD_RADIUS,
+              marginTop: selectionMode === "origin" && !origin ? 14 : 0,
+              border: selectionMode === "origin" ? "2px solid #3b82f6" : "1px solid #f3f4f6",
+            }}
           >
             {selectionMode === "origin" && !origin && (
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="absolute -top-3.5 left-5 rounded-full bg-blue-500 px-3.5 py-1 text-xs font-semibold text-white shadow-sm"
+                className="absolute -top-[14px] left-3 bg-blue-500 text-xs font-semibold text-white"
+                style={{ borderRadius: PILL_RADIUS, paddingLeft: PILL_PADDING_X, paddingRight: PILL_PADDING_X, paddingTop: PILL_PADDING_Y, paddingBottom: PILL_PADDING_Y }}
               >
                 Tap a stop on the map
               </motion.div>
             )}
-            <div className="flex items-center gap-4">
+            <div style={{ padding: CARD_PADDING }} className="flex items-center gap-4">
               <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-blue-50">
                 <Navigation className="h-5 w-5 text-blue-500" />
               </div>
@@ -337,27 +362,27 @@ export function WelcomeScreen() {
             }}
             transition={{ delay: 0.3 }}
             onClick={handleDestinationCardClick}
-            className={`pointer-events-auto relative w-full rounded-3xl bg-white px-10 py-10 text-left shadow-md transition-all ${
-              origin
-                ? "cursor-pointer hover:shadow-lg"
-                : "cursor-not-allowed opacity-50"
-            } ${
-              selectionMode === "destination"
-                ? "border-[2.5px] border-green-500"
-                : "border border-gray-100"
+            className={`pointer-events-auto relative w-full bg-white text-left shadow-md transition-all ${
+              origin ? "cursor-pointer hover:shadow-lg" : "cursor-not-allowed opacity-50"
             }`}
+            style={{
+              borderRadius: CARD_RADIUS,
+              marginTop: selectionMode === "destination" && origin && !destination ? 14 : 0,
+              border: selectionMode === "destination" ? "2px solid #22c55e" : "1px solid #f3f4f6",
+            }}
             disabled={!origin}
           >
             {selectionMode === "destination" && origin && !destination && (
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="absolute -top-3.5 left-5 rounded-full bg-green-500 px-3.5 py-1 text-xs font-semibold text-white shadow-sm"
+                className="absolute -top-[14px] left-3 bg-green-500 text-xs font-semibold text-white"
+                style={{ borderRadius: PILL_RADIUS, paddingLeft: PILL_PADDING_X, paddingRight: PILL_PADDING_X, paddingTop: PILL_PADDING_Y, paddingBottom: PILL_PADDING_Y }}
               >
                 Tap a stop on the map
               </motion.div>
             )}
-            <div className="flex items-center gap-4">
+            <div style={{ padding: CARD_PADDING }} className="flex items-center gap-4">
               <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-green-50">
                 <MapPin className="h-5 w-5 text-green-500" />
               </div>
