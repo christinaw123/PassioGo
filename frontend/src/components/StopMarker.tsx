@@ -27,6 +27,7 @@ export function StopMarker({
     // Never override transform on this element.
     const el = document.createElement("div");
     el.className = "stop-marker";
+    let hoverPopup: mapboxgl.Popup | null = null;
 
     if (type === "origin") {
       el.style.cssText = "width:28px;height:28px;";
@@ -65,6 +66,23 @@ export function StopMarker({
         });
       }
       el.appendChild(dot);
+
+      // Show stop name on hover
+      if (name) {
+        hoverPopup = new mapboxgl.Popup({
+          offset: 15,
+          closeButton: false,
+          closeOnClick: false,
+          className: "stop-label-popup",
+        }).setText(name);
+
+        el.addEventListener("mouseenter", () => {
+          hoverPopup!.setLngLat([lng, lat]).addTo(map);
+        });
+        el.addEventListener("mouseleave", () => {
+          hoverPopup!.remove();
+        });
+      }
     }
 
     if (interactive && onClick) {
@@ -91,6 +109,7 @@ export function StopMarker({
     markerRef.current = marker;
 
     return () => {
+      hoverPopup?.remove();
       marker.remove();
     };
   }, [map, lng, lat, type, interactive, onClick, name]);
