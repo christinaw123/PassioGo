@@ -6,7 +6,7 @@ import { VehicleMarker } from "../VehicleMarker";
 import { RouteTrail } from "../RouteTrail";
 import { BottomSheet } from "../BottomSheet";
 import { Bus, ChevronLeft } from "lucide-react";
-import { motion, AnimatePresence } from "motion/react";
+import { motion } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
   nearestPointOnLine,
@@ -38,7 +38,7 @@ type BusState =
   | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
   | { type: "dwelling"; vehicle: Vehicle; scheduledDepUnix: number | null }
   | { type: "departed"; vehicle: Vehicle | null; nextDepartures: NextDeparture[] }
-  | { type: "no-data"; nextDepartures: NextDeparture[] };
+  | { type: "no-data"; vehicle: Vehicle | null; nextDepartures: NextDeparture[] };
 
 // ─── Layout knobs ────────────────────────────────────────────────────────────
 /** Top margin for the sheet content area, in px */
@@ -154,7 +154,7 @@ function detectBusState(
       haversineDistance([best.lon, best.lat], originLngLat) ? v : best;
   }, null);
 
-  if (vehicles.length === 0) return { type: "no-data", nextDepartures: [] };
+  if (vehicles.length === 0) return { type: "no-data", vehicle: null, nextDepartures: [] };
   return { type: "departed", vehicle: closestVehicle, nextDepartures: [] };
 }
 
@@ -303,7 +303,7 @@ export function TrackingPreBoardScreen() {
             state = raw;
           }
         } else {
-          state = { type: "no-data", nextDepartures: [] };
+          state = { type: "no-data", vehicle: null, nextDepartures: [] };
         }
         setBusState(state);
       } catch (e) {
@@ -444,10 +444,6 @@ export function TrackingPreBoardScreen() {
     );
   }
 
-  // Only show the "has left" toast when there's genuinely no upcoming departure.
-  // If a next scheduled departure exists, we're tracking that trip — no toast needed.
-  const isDeparted = busState?.type === "departed" && busState.nextDepartures.length === 0;
-
   return (
     <div className="relative mx-auto h-full w-full max-w-[430px] overflow-hidden bg-white">
       {/* Map */}
@@ -511,39 +507,6 @@ export function TrackingPreBoardScreen() {
         <ChevronLeft className="h-5 w-5 text-gray-700" />
       </button>
 
-      {/* Departed overlay/toast */}
-      <AnimatePresence>
-        {isDeparted && (
-          <motion.div
-            initial={{ opacity: 0, y: -20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -20 }}
-            className="absolute left-4 right-4 top-24 z-40 bg-white shadow-xl"
-            style={{ borderRadius: STATUS_CARD_RADIUS, padding: STATUS_CARD_PADDING, borderLeft: `4px solid ${shuttle.color}` }}
-          >
-            <div className="mb-1 font-medium text-gray-900">Your shuttle has left.</div>
-            <div className="mb-3 text-sm text-gray-500">
-              Check available shuttles for the next one.
-            </div>
-            {busState?.type === "departed" && busState.nextDepartures.length > 0 && (
-              <div className="mb-3 text-sm text-gray-700">
-                Next departure: <span className="font-medium">{busState.nextDepartures[0].departure_display}</span>
-              </div>
-            )}
-            <button
-              onClick={() =>
-                navigate("/shuttle-selection", {
-                  state: { origin, destination },
-                })
-              }
-              className="w-full cursor-pointer rounded-xl py-2 font-medium text-white"
-              style={{ backgroundColor: shuttle.color }}
-            >
-              Go Back
-            </button>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* Bottom sheet */}
       <BottomSheet height="auto">

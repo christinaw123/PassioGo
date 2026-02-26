@@ -338,18 +338,18 @@ export function ShuttleSelectionScreen() {
           })
         );
 
-        // Sort: arriving first (by ETA), then dwelling, then departed/no-data
-        const sorted = allOptions.sort((a, b) => {
-          const rank = (s: BusState) =>
-            s.type === "arriving" ? 0 : s.type === "dwelling" ? 1 : 2;
-          const ra = rank(a.busState);
-          const rb = rank(b.busState);
-          if (ra !== rb) return ra - rb;
-          if (a.busState.type === "arriving" && b.busState.type === "arriving") {
-            return a.busState.etaMinutes - b.busState.etaMinutes;
+        // Sort by effective minutes until the shuttle is at the user's stop,
+        // regardless of whether that comes from a live ETA or a scheduled departure.
+        const effectiveMins = (s: BusState): number => {
+          const now = Date.now() / 1000;
+          if (s.type === "dwelling") return 0;
+          if (s.type === "arriving") return s.etaMinutes;
+          if ((s.type === "departed" || s.type === "no-data") && s.nextDepartures.length > 0) {
+            return Math.max(0, (s.nextDepartures[0].departure_unix - now) / 60);
           }
-          return 0;
-        });
+          return Infinity;
+        };
+        const sorted = allOptions.sort((a, b) => effectiveMins(a.busState) - effectiveMins(b.busState));
 
         if (!signal.aborted) setShuttleOptions(sorted);
       } catch (e) {
