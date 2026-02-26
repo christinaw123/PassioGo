@@ -9,12 +9,14 @@ import { Bus, ChevronLeft } from "lucide-react";
 import { motion } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
-  nearestPointOnLine,
-  clipLineSegment,
-  haversineDistance,
   buildPrecomputedRoute,
   type PrecomputedRoute,
 } from "../../utils/geo";
+import {
+  computeApproachTrail,
+  detectBusState,
+  type NextDeparture,
+} from "../../utils/busState";
 
 interface Vehicle {
   id: string;
@@ -27,136 +29,24 @@ interface Vehicle {
   stop_id: string | null;
 }
 
-interface NextDeparture {
-  trip_id: string;
-  departure_unix: number;
-  departure_display: string;
-  prev_block_trip_id: string | null;
-}
-
 type BusState =
   | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
   | { type: "dwelling"; vehicle: Vehicle; scheduledDepUnix: number | null }
   | { type: "departed"; vehicle: Vehicle | null; nextDepartures: NextDeparture[] }
   | { type: "no-data"; vehicle: Vehicle | null; nextDepartures: NextDeparture[] };
 
-// ─── Layout knobs ────────────────────────────────────────────────────────────
-/** Top margin for the sheet content area, in px */
-const SHEET_CONTENT_TOP_MARGIN = 12;    // try: 4   8   12  16
-/** Bottom margin below the route header block, in px */
-const HEADER_MARGIN_BOTTOM = 16;       // try: 12  16  20  24
-/** Gap between the route color icon and the route name/destination text, in px */
-const HEADER_GAP = 12;                 // try: 8   12  16
-/** Size (width & height) of the route color icon, in px */
-const HEADER_ICON_SIZE = 48;           // try: 36  40  44  48
-/** Corner radius of the route color icon, in px */
-const HEADER_ICON_RADIUS = 12;         // try: 8   10  12  16
-/** Corner radius of the status card (arriving / dwelling / no-data), in px */
-const STATUS_CARD_RADIUS = 16;         // try: 8   12  16  20  24
-/** Padding inside the status card, in px */
-const STATUS_CARD_PADDING = 16;        // try: 12  16  20  24
-/** Bottom margin below the status card, in px */
-const STATUS_CARD_MARGIN = 24;         // try: 12  16  20  24
-/** Corner radius of the "View Available Shuttles" button, in px */
-const MISSED_BTN_RADIUS = 16;          // try: 8   12  16  20  24
-/** Vertical padding of the "View Available Shuttles" button, in px */
-const MISSED_BTN_PADDING_Y = 16;       // try: 10  12  14  16
+// ─── Layout knobs ─────────────────────────────────────────────────────────────
+const SHEET_CONTENT_TOP_MARGIN = 12;
+const HEADER_MARGIN_BOTTOM = 16;
+const HEADER_GAP = 12;
+const HEADER_ICON_SIZE = 48;
+const HEADER_ICON_RADIUS = 12;
+const STATUS_CARD_RADIUS = 16;
+const STATUS_CARD_PADDING = 16;
+const STATUS_CARD_MARGIN = 24;
+const MISSED_BTN_RADIUS = 16;
+const MISSED_BTN_PADDING_Y = 16;
 // ─────────────────────────────────────────────────────────────────────────────
-
-/** Tight haversine fallback for dwell (when no stop_id available). 50 m keeps
- *  "at stop now" from firing for a bus parked on the other side of a building. */
-const DWELL_DISTANCE_M = 50;
-/** Show vehicle icon up to this many meters past origin before hiding it */
-const DEPARTED_SHOW_DISTANCE_M = 500;
-
-/** Best-effort trail from vehicle to origin along the route shape, for map display only.
- *  Returns [] if the trail can't be built (arriving state is unaffected). */
-function computeApproachTrail(
-  vehicle: Vehicle,
-  originStop: { id: string; lat: number; lon: number },
-  routeCoords: [number, number][],
-  precomputed?: PrecomputedRoute
-): [number, number][] {
-  if (routeCoords.length < 2) return [];
-  try {
-    const isLoop: boolean = precomputed?.isLoop ??
-      (routeCoords.length >= 10 &&
-        haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100);
-    const originProj =
-      precomputed?.stopProjs && (precomputed?.originIdx ?? -1) >= 0
-        ? precomputed.stopProjs[precomputed.originIdx]
-        : nearestPointOnLine(routeCoords, [originStop.lon, originStop.lat]);
-    const vProj = nearestPointOnLine(routeCoords, [vehicle.lon, vehicle.lat]);
-    if (
-      vProj.segIndex < originProj.segIndex ||
-      (vProj.segIndex === originProj.segIndex && vProj.t <= originProj.t)
-    ) {
-      const trail = clipLineSegment(routeCoords, vProj.segIndex, vProj.projPoint, originProj.segIndex, originProj.projPoint);
-      return trail.length >= 2 ? trail : [];
-    } else if (isLoop) {
-      const toEnd = clipLineSegment(routeCoords, vProj.segIndex, vProj.projPoint, routeCoords.length - 2, routeCoords[routeCoords.length - 1]);
-      const fromStart = clipLineSegment(routeCoords, 0, routeCoords[0], originProj.segIndex, originProj.projPoint);
-      const stitched = [...toEnd, ...fromStart];
-      return stitched.length >= 2 ? stitched : [];
-    }
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-function detectBusState(
-  vehicles: Vehicle[],
-  originStop: { id: string; lat: number; lon: number },
-  feedEtas: { trip_id: string | null; arrival_time: number | null }[],
-  routeCoords: [number, number][],
-  precomputed?: PrecomputedRoute
-): BusState {
-  const originLngLat: [number, number] = [originStop.lon, originStop.lat];
-
-  // Dwell check: vehicle is physically at the stop.
-  for (const v of vehicles) {
-    const dist = haversineDistance([v.lon, v.lat], originLngLat);
-    const isDwelling =
-      (v.stop_id != null && v.stop_id === originStop.id && dist <= 100) ||
-      dist <= DWELL_DISTANCE_M;
-    if (isDwelling) return { type: "dwelling", vehicle: v, scheduledDepUnix: null };
-  }
-
-  // Use PassioGo's trip updates feed to find the soonest arriving vehicle.
-  // Match each ETA entry to a visible vehicle by trip_id.
-  const vehicleByTripId = new Map(vehicles.map(v => [v.trip_id, v]));
-  const now = Date.now() / 1000;
-  let bestEta = Infinity;
-  let bestVehicle: Vehicle | null = null;
-  let bestTrail: [number, number][] = [];
-
-  for (const e of feedEtas) {
-    if (!e.trip_id || e.arrival_time == null || e.arrival_time <= now) continue;
-    const vehicle = vehicleByTripId.get(e.trip_id);
-    if (!vehicle) continue;
-    const etaMin = Math.max(1, Math.round((e.arrival_time - now) / 60));
-    if (etaMin < bestEta) {
-      bestEta = etaMin;
-      bestVehicle = vehicle;
-      bestTrail = computeApproachTrail(vehicle, originStop, routeCoords, precomputed);
-    }
-  }
-
-  if (bestVehicle) {
-    return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
-  }
-
-  // No feed ETA matched a visible vehicle — shuttle departed or feed not yet publishing.
-  const closestVehicle = vehicles.reduce<Vehicle | null>((best, v) => {
-    if (!best) return v;
-    return haversineDistance([v.lon, v.lat], originLngLat) <
-      haversineDistance([best.lon, best.lat], originLngLat) ? v : best;
-  }, null);
-
-  if (vehicles.length === 0) return { type: "no-data", vehicle: null, nextDepartures: [] };
-  return { type: "departed", vehicle: closestVehicle, nextDepartures: [] };
-}
 
 export function TrackingPreBoardScreen() {
   const navigate = useNavigate();
@@ -283,11 +173,11 @@ export function TrackingPreBoardScreen() {
             }
           } catch { /* no feed ETAs — schedule fallback will be used */ }
 
-          const raw = detectBusState(vehicles, oStop, feedEtas, coords, initPrecomputed ?? undefined);
-          if (raw.type === "dwelling") {
-            const depUnix = await fetchScheduledDeparture(raw.vehicle.trip_id, oStop.id);
-            state = { type: "dwelling", vehicle: raw.vehicle, scheduledDepUnix: depUnix };
-          } else if (raw.type === "departed" || raw.type === "no-data") {
+          const detectedState = detectBusState(vehicles, oStop, feedEtas, coords, initPrecomputed ?? undefined);
+          if (detectedState.type === "dwelling") {
+            const depUnix = await fetchScheduledDeparture(detectedState.vehicle.trip_id, oStop.id);
+            state = { type: "dwelling", vehicle: detectedState.vehicle, scheduledDepUnix: depUnix };
+          } else if (detectedState.type === "departed" || detectedState.type === "no-data") {
             const nextDeps = await fetchNextDepartures(shuttle.route_id, oStop.id);
             // Match the vehicle that will run the next scheduled trip.
             // Primary: match the preceding block trip (vehicle is currently running it).
@@ -298,9 +188,9 @@ export function TrackingPreBoardScreen() {
                   ?? null)
               : null;
             console.log('[TrackingPreBoard] next dep:', nextDeps[0]?.trip_id, 'prev_block:', nextDeps[0]?.prev_block_trip_id, 'live trip_ids:', vehicles.map(v => v.trip_id), 'matched:', !!nextTripVehicle);
-            state = { ...raw, nextDepartures: nextDeps, vehicle: nextTripVehicle } as BusState;
+            state = { ...detectedState, nextDepartures: nextDeps, vehicle: nextTripVehicle } as BusState;
           } else {
-            state = raw;
+            state = detectedState;
           }
         } else {
           state = { type: "no-data", vehicle: null, nextDepartures: [] };
@@ -377,22 +267,22 @@ export function TrackingPreBoardScreen() {
           feedEtas = etaData.etas || [];
         }
 
-        const raw = detectBusState(vehicles, oStop, feedEtas, coords, precomputedRef.current ?? undefined);
+        const detectedState = detectBusState(vehicles, oStop, feedEtas, coords, precomputedRef.current ?? undefined);
         let state: BusState;
 
-        if (raw.type === "dwelling") {
-          const depUnix = await fetchScheduledDeparture(raw.vehicle.trip_id, oStop.id);
-          state = { type: "dwelling", vehicle: raw.vehicle, scheduledDepUnix: depUnix };
-        } else if (raw.type === "departed" || raw.type === "no-data") {
+        if (detectedState.type === "dwelling") {
+          const depUnix = await fetchScheduledDeparture(detectedState.vehicle.trip_id, oStop.id);
+          state = { type: "dwelling", vehicle: detectedState.vehicle, scheduledDepUnix: depUnix };
+        } else if (detectedState.type === "departed" || detectedState.type === "no-data") {
           const nextDeps = await fetchNextDepartures(shuttle.route_id, oStop.id);
           const nextTripVehicle = nextDeps.length > 0
             ? (vehicles.find(v => v.trip_id === nextDeps[0].prev_block_trip_id)
                 ?? vehicles.find(v => v.trip_id === nextDeps[0].trip_id)
                 ?? null)
             : null;
-          state = { ...raw, nextDepartures: nextDeps, vehicle: nextTripVehicle } as BusState;
+          state = { ...detectedState, nextDepartures: nextDeps, vehicle: nextTripVehicle } as BusState;
         } else {
-          state = raw;
+          state = detectedState;
         }
 
         setBusState(state);

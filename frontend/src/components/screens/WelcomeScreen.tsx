@@ -296,7 +296,7 @@ export function WelcomeScreen() {
         className="pointer-events-none absolute bottom-0 left-0 right-0"
         style={{ paddingLeft: CARD_SIDE_PADDING, paddingRight: CARD_SIDE_PADDING, paddingBottom: CARD_BOTTOM_PADDING }}
       >
-        {/* Floating locate button — above the cards, right-aligned */}
+        {/* locate button  */}
         <div className="mb-3 flex justify-end">
           <motion.button
             initial={{ scale: 0, opacity: 0 }}

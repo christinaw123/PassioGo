@@ -9,12 +9,14 @@ import { Clock, ChevronLeft } from "lucide-react";
 import { motion } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
-  nearestPointOnLine,
-  clipLineSegment,
-  haversineDistance,
   buildPrecomputedRoute,
   type PrecomputedRoute,
 } from "../../utils/geo";
+import {
+  computeApproachTrail,
+  detectBusState,
+  type NextDeparture,
+} from "../../utils/busState";
 
 interface RouteInfo {
   route_id: string;
@@ -35,13 +37,6 @@ interface Vehicle {
   stop_name: string | null;
 }
 
-interface NextDeparture {
-  trip_id: string;
-  departure_unix: number;
-  departure_display: string;
-  prev_block_trip_id: string | null;
-}
-
 type BusState =
   | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
   | { type: "dwelling"; vehicle: Vehicle; scheduledDepUnix: number | null }
@@ -56,114 +51,19 @@ interface ShuttleOption {
   precomputed: PrecomputedRoute | null;
 }
 
-// ─── Layout knobs ────────────────────────────────────────────────────────────
-/** Corner radius of each shuttle option card, in px */
-const SHUTTLE_CARD_RADIUS = 16;       // try: 8  12  16  20  24
-/** Padding inside each shuttle option card, in px */
-const SHUTTLE_CARD_PADDING = 12;      // try: 12  16  20  24
-/** Vertical gap between shuttle option cards, in px */
-const SHUTTLE_CARD_GAP = 12;          // try: 6  8  12  16
-/** Gap between the route name/eta block and the color dot, in px */
-const SHUTTLE_ITEM_GAP = 16;          // try: 8  12  16  24
-/** Gap between the clock icon and the ETA text, in px */
-const SHUTTLE_ETA_ICON_GAP = 4;       // try: 2  4  6  8
-/** Corner radius of the "Track" confirm button, in px */
-const SHUTTLE_BTN_RADIUS = 16;        // try: 8  12  16  20  24
-/** Padding of the "Track" confirm button, in px */
-const SHUTTLE_BTN_PADDING = 12;       // try: 12  16  20
-/** Top margin above the "Available Shuttles" heading, in px */
-const HEADER_TOP_MARGIN =12;          // try: 4   8   12  16
-/** Bottom margin below the "From X to Y" subtitle (gap before cards), in px */
-const HEADER_SUBTITLE_MARGIN = 12;    // try: 12  16  20  24
+// ─── Layout knobs ─────────────────────────────────────────────────────────────
+const SHUTTLE_CARD_RADIUS = 16;
+const SHUTTLE_CARD_PADDING = 12;
+const SHUTTLE_CARD_GAP = 12;
+const SHUTTLE_ITEM_GAP = 16;
+const SHUTTLE_ETA_ICON_GAP = 4;
+const SHUTTLE_BTN_RADIUS = 16;
+const SHUTTLE_BTN_PADDING = 12;
+const HEADER_TOP_MARGIN = 12;
+const HEADER_SUBTITLE_MARGIN = 4;
+const SUBTITLE_CARDS_GAP = 12;
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DWELL_DISTANCE_M = 50;
-
-/** Best-effort trail from vehicle to origin along the route shape, for map display only.
- *  Returns [] if the trail can't be built (arriving state is unaffected). */
-function computeApproachTrail(
-  vehicle: Vehicle,
-  originStop: { id: string; lat: number; lon: number },
-  routeCoords: [number, number][],
-  precomputed?: PrecomputedRoute
-): [number, number][] {
-  if (routeCoords.length < 2) return [];
-  try {
-    const isLoop: boolean = precomputed?.isLoop ??
-      (routeCoords.length >= 10 &&
-        haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100);
-    const originProj =
-      precomputed?.stopProjs && (precomputed?.originIdx ?? -1) >= 0
-        ? precomputed.stopProjs[precomputed.originIdx]
-        : nearestPointOnLine(routeCoords, [originStop.lon, originStop.lat]);
-    const vProj = nearestPointOnLine(routeCoords, [vehicle.lon, vehicle.lat]);
-    if (
-      vProj.segIndex < originProj.segIndex ||
-      (vProj.segIndex === originProj.segIndex && vProj.t <= originProj.t)
-    ) {
-      const trail = clipLineSegment(routeCoords, vProj.segIndex, vProj.projPoint, originProj.segIndex, originProj.projPoint);
-      return trail.length >= 2 ? trail : [];
-    } else if (isLoop) {
-      const toEnd = clipLineSegment(routeCoords, vProj.segIndex, vProj.projPoint, routeCoords.length - 2, routeCoords[routeCoords.length - 1]);
-      const fromStart = clipLineSegment(routeCoords, 0, routeCoords[0], originProj.segIndex, originProj.projPoint);
-      const stitched = [...toEnd, ...fromStart];
-      return stitched.length >= 2 ? stitched : [];
-    }
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-function detectBusState(
-  vehicles: Vehicle[],
-  originStop: { id: string; lat: number; lon: number },
-  feedEtas: { trip_id: string | null; arrival_time: number | null }[],
-  routeCoords: [number, number][],
-  precomputed?: PrecomputedRoute
-):
-  | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
-  | { type: "dwelling"; vehicle: Vehicle; scheduledDepUnix: null }
-  | { type: "departed" | "no-data"; nextDepartures: NextDeparture[]; vehicle: null }
-{
-  const originLngLat: [number, number] = [originStop.lon, originStop.lat];
-
-  // Dwell check: vehicle is physically at the stop.
-  for (const v of vehicles) {
-    const dist = haversineDistance([v.lon, v.lat], originLngLat);
-    const isDwelling =
-      (v.stop_id != null && v.stop_id === originStop.id && dist <= 100) ||
-      dist <= DWELL_DISTANCE_M;
-    if (isDwelling) return { type: "dwelling", vehicle: v, scheduledDepUnix: null };
-  }
-
-  // Use PassioGo's trip updates feed to find the soonest arriving vehicle.
-  // Match each ETA entry to a visible vehicle by trip_id.
-  const vehicleByTripId = new Map(vehicles.map(v => [v.trip_id, v]));
-  const now = Date.now() / 1000;
-  let bestEta = Infinity;
-  let bestVehicle: Vehicle | null = null;
-  let bestTrail: [number, number][] = [];
-
-  for (const e of feedEtas) {
-    if (!e.trip_id || e.arrival_time == null || e.arrival_time <= now) continue;
-    const vehicle = vehicleByTripId.get(e.trip_id);
-    if (!vehicle) continue;
-    const etaMin = Math.max(1, Math.round((e.arrival_time - now) / 60));
-    if (etaMin < bestEta) {
-      bestEta = etaMin;
-      bestVehicle = vehicle;
-      bestTrail = computeApproachTrail(vehicle, originStop, routeCoords, precomputed);
-    }
-  }
-
-  if (bestVehicle) {
-    return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
-  }
-
-  if (vehicles.length === 0) return { type: "no-data", nextDepartures: [], vehicle: null };
-  return { type: "departed", nextDepartures: [], vehicle: null };
-}
 
 export function ShuttleSelectionScreen() {
   const navigate = useNavigate();
@@ -313,12 +213,12 @@ export function ShuttleSelectionScreen() {
 
             let busState: BusState;
             if (oStop) {
-              const raw = detectBusState(vehicles, oStop, feedEtas, routeCoords, precomputed ?? undefined);
-              if (raw.type === "dwelling") {
-                const dwellingVehicle = raw.vehicle;
+              const detectedState = detectBusState(vehicles, oStop, feedEtas, routeCoords, precomputed ?? undefined);
+              if (detectedState.type === "dwelling") {
+                const dwellingVehicle = detectedState.vehicle;
                 const depUnix = await fetchScheduledDeparture(dwellingVehicle.trip_id, oStop.id);
                 busState = { type: "dwelling", vehicle: dwellingVehicle, scheduledDepUnix: depUnix };
-              } else if (raw.type === "departed" || raw.type === "no-data") {
+              } else if (detectedState.type === "departed" || detectedState.type === "no-data") {
                 const nextDepartures = await fetchNextDepartures(route.route_id, oStop.id);
                 const nextVehicle = nextDepartures.length > 0
                   ? (vehicles.find(v => v.trip_id === nextDepartures[0].prev_block_trip_id)
@@ -326,9 +226,9 @@ export function ShuttleSelectionScreen() {
                       ?? null)
                   : null;
                 console.log(`[${route.route_name}] next trip_id:`, nextDepartures[0]?.trip_id, '| prev_block_trip_id:', nextDepartures[0]?.prev_block_trip_id, '| live trip_ids:', vehicles.map(v => v.trip_id), '| matched:', !!nextVehicle);
-                busState = { type: raw.type, nextDepartures, vehicle: nextVehicle };
+                busState = { type: detectedState.type, nextDepartures, vehicle: nextVehicle };
               } else {
-                busState = raw as BusState;
+                busState = detectedState as BusState;
               }
             } else {
               busState = { type: "no-data", nextDepartures: [], vehicle: null };
@@ -420,14 +320,14 @@ export function ShuttleSelectionScreen() {
               feedEtas = etaData.etas || [];
             }
 
-            const raw = detectBusState(freshVehicles, routeOStop, feedEtas, opt.routeCoords, opt.precomputed ?? undefined);
+            const detectedState = detectBusState(freshVehicles, routeOStop, feedEtas, opt.routeCoords, opt.precomputed ?? undefined);
             let busState: BusState;
 
-            if (raw.type === "dwelling") {
-              const dwellingVehicle = raw.vehicle;
+            if (detectedState.type === "dwelling") {
+              const dwellingVehicle = detectedState.vehicle;
               const depUnix = await fetchScheduledDeparture(dwellingVehicle.trip_id, routeOStop.id);
               busState = { type: "dwelling", vehicle: dwellingVehicle, scheduledDepUnix: depUnix };
-            } else if (raw.type === "departed" || raw.type === "no-data") {
+            } else if (detectedState.type === "departed" || detectedState.type === "no-data") {
               const nextDepartures = await fetchNextDepartures(opt.route.route_id, routeOStop.id);
               const nextVehicle = nextDepartures.length > 0
                 ? (freshVehicles.find(v => v.trip_id === nextDepartures[0].prev_block_trip_id)
@@ -435,9 +335,9 @@ export function ShuttleSelectionScreen() {
                     ?? null)
                 : null;
               console.log(`[poll][${opt.route.route_name}] next trip_id:`, nextDepartures[0]?.trip_id, '| prev_block_trip_id:', nextDepartures[0]?.prev_block_trip_id, '| live trip_ids:', freshVehicles.map(v => v.trip_id), '| matched:', !!nextVehicle);
-              busState = { type: raw.type, nextDepartures, vehicle: nextVehicle };
+              busState = { type: detectedState.type, nextDepartures, vehicle: nextVehicle };
             } else {
-              busState = raw as BusState;
+              busState = detectedState as BusState;
             }
 
             return { ...opt, vehicles: freshVehicles, busState };
@@ -647,13 +547,13 @@ export function ShuttleSelectionScreen() {
       {/* Bottom sheet */}
       <BottomSheet height="45%">
         <div style={{ marginTop: HEADER_TOP_MARGIN }}>
-          <h2 className="mb-1 text-xl font-medium">Available Shuttles</h2>
-          <p className="text-sm text-gray-500" style={{ marginBottom: HEADER_SUBTITLE_MARGIN }}>
+          <h2 className="text-xl font-medium" style={{ marginBottom: HEADER_SUBTITLE_MARGIN }}>Available Shuttles</h2>
+          <p className="text-sm text-gray-500" style={{ marginBottom: SUBTITLE_CARDS_GAP }}>
             From {origin} to {destination}
           </p>
 
           {loading ? (
-            <div className="flex items-center justify-center py-8">
+            <div className="flex justify-center py-8">
               <div className="h-8 w-8 animate-spin rounded-full border-4 border-blue-200 border-t-blue-600" />
             </div>
           ) : visibleOptions.length === 0 ? (
@@ -664,7 +564,7 @@ export function ShuttleSelectionScreen() {
               </p>
             </div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: SHUTTLE_CARD_GAP }}>
+            <div className="flex flex-col" style={{ gap: SHUTTLE_CARD_GAP }}>
               {visibleOptions.map((opt, index) => {
                 const isSelected = selectedShuttle?.route.route_id === opt.route.route_id;
 
@@ -672,23 +572,18 @@ export function ShuttleSelectionScreen() {
                   <motion.button
                     key={opt.route.route_id}
                     initial={{ y: 20, opacity: 0 }}
-                    animate={{
-                      y: 0,
-                      opacity: 1,
-                      scale: isSelected ? 1.02 : 1,
-                    }}
+                    animate={{ y: 0, opacity: 1, scale: isSelected ? 1.02 : 1 }}
                     transition={{ delay: index * 0.1 }}
                     onClick={() => setSelectedShuttle(opt)}
                     className="w-full cursor-pointer bg-white text-left transition-all hover:shadow-md"
                     style={{
                       borderRadius: SHUTTLE_CARD_RADIUS,
                       padding: SHUTTLE_CARD_PADDING,
+                      border: isSelected ? `2px solid ${opt.route.route_color}` : "1px solid #e5e7eb",
                       borderLeft: `4px solid ${opt.route.route_color}`,
-                      border: isSelected ? `2px solid ${opt.route.route_color}` : "2px solid #f3f4f6",
-                      borderLeftWidth: 4,
                       boxShadow: isSelected
                         ? `0 0 0 2px ${opt.route.route_color}40, 0 8px 16px -4px ${opt.route.route_color}30`
-                        : "0 1px 3px 0 rgb(0 0 0 / 0.1)",
+                        : undefined,
                     }}
                   >
                     <div className="flex items-center justify-between" style={{ gap: SHUTTLE_ITEM_GAP }}>
@@ -713,11 +608,11 @@ export function ShuttleSelectionScreen() {
                   initial={{ y: 20, opacity: 0 }}
                   animate={{ y: 0, opacity: 1 }}
                   onClick={handleConfirm}
-                  className="mt-4 w-full cursor-pointer font-medium text-white shadow-md transition-all hover:shadow-lg"
+                  className="mt-4 w-full cursor-pointer font-medium text-white shadow-md transition-all hover:shadow-lg hover:opacity-90"
                   style={{
+                    backgroundColor: selectedShuttle.route.route_color,
                     borderRadius: SHUTTLE_BTN_RADIUS,
                     padding: SHUTTLE_BTN_PADDING,
-                    backgroundColor: selectedShuttle.route.route_color,
                   }}
                 >
                   Track {selectedShuttle.route.route_name}

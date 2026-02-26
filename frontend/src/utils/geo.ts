@@ -1,4 +1,4 @@
-/** Haversine distance between two [lng, lat] points in meters */
+/** Have rsine distance between two [lng, lat] points in meters */
 export function haversineDistance(
   a: [number, number],
   b: [number, number]
