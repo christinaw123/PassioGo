@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { useNavigate, useLocation } from "react-router";
-import { Map } from "../Map";
+import { Map as MapView } from "../Map";
 import { StopMarker } from "../StopMarker";
 import { VehicleMarker } from "../VehicleMarker";
 import { RouteTrail } from "../RouteTrail";
@@ -10,9 +10,7 @@ import { motion } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
   nearestPointOnLine,
-  nearestPointOnLineInRange,
   clipLineSegment,
-  lineLength,
   haversineDistance,
   buildPrecomputedRoute,
   type PrecomputedRoute,
@@ -41,12 +39,13 @@ interface NextDeparture {
   trip_id: string;
   departure_unix: number;
   departure_display: string;
+  prev_block_trip_id: string | null;
 }
 
 type BusState =
   | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
-  | { type: "dwelling"; vehicle: Vehicle; leavingInMinutes: number | null }
-  | { type: "departed" | "no-data"; nextDepartures: NextDeparture[] };
+  | { type: "dwelling"; vehicle: Vehicle; scheduledDepUnix: number | null }
+  | { type: "departed" | "no-data"; nextDepartures: NextDeparture[]; vehicle: Vehicle | null };
 
 interface ShuttleOption {
   route: RouteInfo;
@@ -78,138 +77,92 @@ const HEADER_TOP_MARGIN =12;          // try: 4   8   12  16
 const HEADER_SUBTITLE_MARGIN = 12;    // try: 12  16  20  24
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** ~12 mph average shuttle speed in m/s */
-const AVG_SPEED_MPS = 5.4;
 const DWELL_DISTANCE_M = 50;
-const BLEND_MIN_SPEED_MPS = 1.0;
-const MAX_OFF_ROUTE_M = 500;
+
+/** Best-effort trail from vehicle to origin along the route shape, for map display only.
+ *  Returns [] if the trail can't be built (arriving state is unaffected). */
+function computeApproachTrail(
+  vehicle: Vehicle,
+  originStop: { id: string; lat: number; lon: number },
+  routeCoords: [number, number][],
+  precomputed?: PrecomputedRoute
+): [number, number][] {
+  if (routeCoords.length < 2) return [];
+  try {
+    const isLoop: boolean = precomputed?.isLoop ??
+      (routeCoords.length >= 10 &&
+        haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100);
+    const originProj =
+      precomputed?.stopProjs && (precomputed?.originIdx ?? -1) >= 0
+        ? precomputed.stopProjs[precomputed.originIdx]
+        : nearestPointOnLine(routeCoords, [originStop.lon, originStop.lat]);
+    const vProj = nearestPointOnLine(routeCoords, [vehicle.lon, vehicle.lat]);
+    if (
+      vProj.segIndex < originProj.segIndex ||
+      (vProj.segIndex === originProj.segIndex && vProj.t <= originProj.t)
+    ) {
+      const trail = clipLineSegment(routeCoords, vProj.segIndex, vProj.projPoint, originProj.segIndex, originProj.projPoint);
+      return trail.length >= 2 ? trail : [];
+    } else if (isLoop) {
+      const toEnd = clipLineSegment(routeCoords, vProj.segIndex, vProj.projPoint, routeCoords.length - 2, routeCoords[routeCoords.length - 1]);
+      const fromStart = clipLineSegment(routeCoords, 0, routeCoords[0], originProj.segIndex, originProj.projPoint);
+      const stitched = [...toEnd, ...fromStart];
+      return stitched.length >= 2 ? stitched : [];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
 
 function detectBusState(
   vehicles: Vehicle[],
   originStop: { id: string; lat: number; lon: number },
+  feedEtas: { trip_id: string | null; arrival_time: number | null }[],
   routeCoords: [number, number][],
   precomputed?: PrecomputedRoute
 ):
   | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
-  | { type: "dwelling"; vehicle: Vehicle }
-  | { type: "departed" | "no-data"; nextDepartures: NextDeparture[] }
+  | { type: "dwelling"; vehicle: Vehicle; scheduledDepUnix: null }
+  | { type: "departed" | "no-data"; nextDepartures: NextDeparture[]; vehicle: null }
 {
-  if (vehicles.length === 0) return { type: "no-data", nextDepartures: [] };
-
   const originLngLat: [number, number] = [originStop.lon, originStop.lat];
 
-  // Dwell check — prefer stop_id match (more accurate than haversine alone)
+  // Dwell check: vehicle is physically at the stop.
   for (const v of vehicles) {
     const dist = haversineDistance([v.lon, v.lat], originLngLat);
     const isDwelling =
       (v.stop_id != null && v.stop_id === originStop.id && dist <= 100) ||
       dist <= DWELL_DISTANCE_M;
-    if (isDwelling) return { type: "dwelling", vehicle: v };
+    if (isDwelling) return { type: "dwelling", vehicle: v, scheduledDepUnix: null };
   }
 
-  if (routeCoords.length < 2) return { type: "departed", nextDepartures: [] };
-
-  type StopProj = { segIndex: number; projPoint: [number, number]; t: number };
-  const stopProjs: StopProj[] | null = precomputed?.stopProjs ?? null;
-  const stopPositions: [number, number][] | null = precomputed?.stopPositions ?? null;
-  const originIdx: number = precomputed?.originIdx ?? -1;
-  const isLoop: boolean = precomputed?.isLoop ??
-    (routeCoords.length >= 10 &&
-      haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100);
-
-  const originProj: StopProj =
-    stopProjs && originIdx >= 0
-      ? stopProjs[originIdx]
-      : nearestPointOnLine(routeCoords, originLngLat);
-
-  const projectVehicle = (v: Vehicle): { vProj: ReturnType<typeof nearestPointOnLine>; nearestStopIdx: number } => {
-    if (stopProjs && stopPositions) {
-      let nearestStopIdx = 0;
-      let nearestDist = Infinity;
-      for (let i = 0; i < stopPositions.length; i++) {
-        const d = haversineDistance([v.lon, v.lat], stopPositions[i]);
-        if (d < nearestDist) { nearestDist = d; nearestStopIdx = i; }
-      }
-      const lo = stopProjs[Math.max(0, nearestStopIdx - 1)].segIndex;
-      const hi = stopProjs[Math.min(stopProjs.length - 1, nearestStopIdx + 1)].segIndex;
-      return { vProj: nearestPointOnLineInRange(routeCoords, [v.lon, v.lat], lo, hi), nearestStopIdx };
-    }
-    return { vProj: nearestPointOnLine(routeCoords, [v.lon, v.lat]), nearestStopIdx: -1 };
-  };
-
+  // Use PassioGo's trip updates feed to find the soonest arriving vehicle.
+  // Match each ETA entry to a visible vehicle by trip_id.
+  const vehicleByTripId = new Map(vehicles.map(v => [v.trip_id, v]));
+  const now = Date.now() / 1000;
   let bestEta = Infinity;
   let bestVehicle: Vehicle | null = null;
   let bestTrail: [number, number][] = [];
 
-  for (const v of vehicles) {
-    const { vProj, nearestStopIdx } = projectVehicle(v);
-    if (vProj.dist > MAX_OFF_ROUTE_M) continue;
-
-    let isApproaching: boolean;
-    if (stopProjs && stopPositions && originIdx >= 0 && nearestStopIdx >= 0) {
-      const N = stopPositions.length;
-      const forwardStopDist = isLoop
-        ? (originIdx - nearestStopIdx + N) % N
-        : originIdx - nearestStopIdx;
-      isApproaching = forwardStopDist > 0 && (isLoop ? forwardStopDist <= N / 2 : true);
-    } else {
-      isApproaching = !(
-        vProj.segIndex > originProj.segIndex ||
-        (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
-      );
-    }
-
-    if (!isApproaching) continue;
-
-    let trail: [number, number][];
-    if (
-      vProj.segIndex < originProj.segIndex ||
-      (vProj.segIndex === originProj.segIndex && vProj.t <= originProj.t)
-    ) {
-      trail = clipLineSegment(
-        routeCoords,
-        vProj.segIndex,
-        vProj.projPoint,
-        originProj.segIndex,
-        originProj.projPoint
-      );
-    } else if (isLoop) {
-      const toEnd = clipLineSegment(
-        routeCoords,
-        vProj.segIndex,
-        vProj.projPoint,
-        routeCoords.length - 2,
-        routeCoords[routeCoords.length - 1]
-      );
-      const fromStart = clipLineSegment(
-        routeCoords,
-        0,
-        routeCoords[0],
-        originProj.segIndex,
-        originProj.projPoint
-      );
-      trail = [...toEnd, ...fromStart];
-    } else {
-      trail = [];
-    }
-
-    if (trail.length < 2) continue;
-
-    const dist = lineLength(trail);
-    const speed = (v.speed ?? 0) > BLEND_MIN_SPEED_MPS ? v.speed! : AVG_SPEED_MPS;
-    const eta = Math.max(1, Math.round(dist / speed / 60));
-
-    if (eta < bestEta) {
-      bestEta = eta;
-      bestVehicle = v;
-      bestTrail = trail;
+  for (const e of feedEtas) {
+    if (!e.trip_id || e.arrival_time == null || e.arrival_time <= now) continue;
+    const vehicle = vehicleByTripId.get(e.trip_id);
+    if (!vehicle) continue;
+    const etaMin = Math.max(1, Math.round((e.arrival_time - now) / 60));
+    if (etaMin < bestEta) {
+      bestEta = etaMin;
+      bestVehicle = vehicle;
+      bestTrail = computeApproachTrail(vehicle, originStop, routeCoords, precomputed);
     }
   }
 
   if (bestVehicle) {
     return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
   }
-  return { type: "departed", nextDepartures: [] };
+
+  if (vehicles.length === 0) return { type: "no-data", nextDepartures: [], vehicle: null };
+  return { type: "departed", nextDepartures: [], vehicle: null };
 }
 
 export function ShuttleSelectionScreen() {
@@ -343,24 +296,42 @@ export function ShuttleSelectionScreen() {
               ? buildPrecomputedRoute(routeCoords, route.stops, [oStop.lon, oStop.lat])
               : null;
 
+            // Fetch PassioGo's predicted arrival times for the origin stop.
+            let feedEtas: { trip_id: string | null; arrival_time: number | null }[] = [];
+            if (oStop) {
+              try {
+                const etaRes = await fetch(
+                  `/api/eta?stop_id=${encodeURIComponent(oStop.id)}`,
+                  { signal }
+                );
+                if (etaRes.ok) {
+                  const etaData = await etaRes.json();
+                  feedEtas = etaData.etas || [];
+                }
+              } catch { /* no feed ETAs — schedule fallback will be used */ }
+            }
+
             let busState: BusState;
             if (oStop) {
-              const raw = detectBusState(vehicles, oStop, routeCoords, precomputed ?? undefined);
+              const raw = detectBusState(vehicles, oStop, feedEtas, routeCoords, precomputed ?? undefined);
               if (raw.type === "dwelling") {
                 const dwellingVehicle = raw.vehicle;
                 const depUnix = await fetchScheduledDeparture(dwellingVehicle.trip_id, oStop.id);
-                const leavingIn = depUnix != null
-                  ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
-                  : null;
-                busState = { type: "dwelling", vehicle: dwellingVehicle, leavingInMinutes: leavingIn };
+                busState = { type: "dwelling", vehicle: dwellingVehicle, scheduledDepUnix: depUnix };
               } else if (raw.type === "departed" || raw.type === "no-data") {
                 const nextDepartures = await fetchNextDepartures(route.route_id, oStop.id);
-                busState = { type: raw.type, nextDepartures };
+                const nextVehicle = nextDepartures.length > 0
+                  ? (vehicles.find(v => v.trip_id === nextDepartures[0].prev_block_trip_id)
+                      ?? vehicles.find(v => v.trip_id === nextDepartures[0].trip_id)
+                      ?? null)
+                  : null;
+                console.log(`[${route.route_name}] next trip_id:`, nextDepartures[0]?.trip_id, '| prev_block_trip_id:', nextDepartures[0]?.prev_block_trip_id, '| live trip_ids:', vehicles.map(v => v.trip_id), '| matched:', !!nextVehicle);
+                busState = { type: raw.type, nextDepartures, vehicle: nextVehicle };
               } else {
                 busState = raw as BusState;
               }
             } else {
-              busState = { type: "no-data", nextDepartures: [] };
+              busState = { type: "no-data", nextDepartures: [], vehicle: null };
             }
 
             return { route, vehicles, busState, routeCoords, precomputed };
@@ -422,13 +393,7 @@ export function ShuttleSelectionScreen() {
       const updated = await Promise.all(
         current.map(async (opt) => {
           try {
-            const res = await fetch(
-              `/api/vehicles?route=${encodeURIComponent(opt.route.route_name)}`
-            );
-            if (!res.ok) return opt;
-            const data = await res.json();
-            const freshVehicles: Vehicle[] = data.vehicles || [];
-
+            // Pre-compute origin stop so we can fetch vehicles + ETA in parallel.
             const routeOStop = oStop
               ? oStop
               : opt.route.stops.find(
@@ -437,21 +402,40 @@ export function ShuttleSelectionScreen() {
                     origin.toLowerCase().includes(s.name.toLowerCase())
                 );
 
+            const [vRes, etaRes] = await Promise.all([
+              fetch(`/api/vehicles?route=${encodeURIComponent(opt.route.route_name)}`),
+              routeOStop
+                ? fetch(`/api/eta?stop_id=${encodeURIComponent(routeOStop.id)}`)
+                : Promise.resolve(null),
+            ]);
+            if (!vRes.ok) return opt;
+            const data = await vRes.json();
+            const freshVehicles: Vehicle[] = data.vehicles || [];
+
             if (!routeOStop) return { ...opt, vehicles: freshVehicles };
 
-            const raw = detectBusState(freshVehicles, routeOStop, opt.routeCoords, opt.precomputed ?? undefined);
+            let feedEtas: { trip_id: string | null; arrival_time: number | null }[] = [];
+            if (etaRes?.ok) {
+              const etaData = await etaRes.json();
+              feedEtas = etaData.etas || [];
+            }
+
+            const raw = detectBusState(freshVehicles, routeOStop, feedEtas, opt.routeCoords, opt.precomputed ?? undefined);
             let busState: BusState;
 
             if (raw.type === "dwelling") {
-              const dwellingVehicle = (raw as { vehicle: Vehicle }).vehicle;
+              const dwellingVehicle = raw.vehicle;
               const depUnix = await fetchScheduledDeparture(dwellingVehicle.trip_id, routeOStop.id);
-              const leavingIn = depUnix != null
-                ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
-                : null;
-              busState = { type: "dwelling", vehicle: dwellingVehicle, leavingInMinutes: leavingIn };
+              busState = { type: "dwelling", vehicle: dwellingVehicle, scheduledDepUnix: depUnix };
             } else if (raw.type === "departed" || raw.type === "no-data") {
               const nextDepartures = await fetchNextDepartures(opt.route.route_id, routeOStop.id);
-              busState = { type: raw.type, nextDepartures };
+              const nextVehicle = nextDepartures.length > 0
+                ? (freshVehicles.find(v => v.trip_id === nextDepartures[0].prev_block_trip_id)
+                    ?? freshVehicles.find(v => v.trip_id === nextDepartures[0].trip_id)
+                    ?? null)
+                : null;
+              console.log(`[poll][${opt.route.route_name}] next trip_id:`, nextDepartures[0]?.trip_id, '| prev_block_trip_id:', nextDepartures[0]?.prev_block_trip_id, '| live trip_ids:', freshVehicles.map(v => v.trip_id), '| matched:', !!nextVehicle);
+              busState = { type: raw.type, nextDepartures, vehicle: nextVehicle };
             } else {
               busState = raw as BusState;
             }
@@ -499,12 +483,41 @@ export function ShuttleSelectionScreen() {
           isSelected: selectedShuttle?.route.route_id === opt.route.route_id,
           pulsing: true,
         });
+      } else if (busState.type === "departed" || busState.type === "no-data") {
+        const isSelected = selectedShuttle?.route.route_id === opt.route.route_id;
+        if (busState.vehicle) {
+          // Block-id match succeeded — show specific vehicle with approach trail.
+          const oStop = originStop;
+          const trail = oStop
+            ? computeApproachTrail(busState.vehicle, oStop, opt.routeCoords, opt.precomputed ?? undefined)
+            : null;
+          results.push({
+            routeId: opt.route.route_id,
+            vehicle: busState.vehicle,
+            trail,
+            color: opt.route.route_color,
+            isSelected,
+            pulsing: false,
+          });
+        } else if (opt.vehicles.length > 0 && busState.nextDepartures.length > 0) {
+          // Can't identify specific vehicle — show ALL live vehicles on the route.
+          // Full route shape as trail for the first entry only (avoids duplicate layers).
+          opt.vehicles.forEach((v, i) => {
+            results.push({
+              routeId: opt.route.route_id,
+              vehicle: v,
+              trail: i === 0 ? opt.routeCoords : null,
+              color: opt.route.route_color,
+              isSelected,
+              pulsing: false,
+            });
+          });
+        }
       }
-      // departed / no-data: no vehicle to show
     }
 
     return results;
-  }, [shuttleOptions, selectedShuttle]);
+  }, [shuttleOptions, selectedShuttle, originStop]);
 
   // Only show departed/no-data routes if their next departure is within 30 min
   const SHOW_WINDOW_S = 30 * 60;
@@ -542,14 +555,18 @@ export function ShuttleSelectionScreen() {
       return `Arrives in ${busState.etaMinutes} min`;
     }
     if (busState.type === "dwelling") {
-      if (busState.leavingInMinutes === 0) return "Departing now";
-      if (busState.leavingInMinutes != null && busState.leavingInMinutes <= 20)
-        return `At stop · leaving in ~${busState.leavingInMinutes} min`;
+      const now = Date.now() / 1000;
+      const dep = busState.scheduledDepUnix;
+      if (dep != null && dep <= now) return "Departing now";
+      if (dep != null) {
+        const mins = Math.round((dep - now) / 60);
+        return mins > 0 ? `At stop · departs in ${mins} min` : "At stop · departing any moment";
+      }
       return "At stop now";
     }
     if (busState.type === "departed" || busState.type === "no-data") {
       if (busState.nextDepartures.length > 0) {
-        return `Next at ${busState.nextDepartures[0].departure_display}`;
+        return `Next scheduled at ${busState.nextDepartures[0].departure_display}`;
       }
       return "No upcoming departures";
     }
@@ -559,7 +576,7 @@ export function ShuttleSelectionScreen() {
   return (
     <div className="relative mx-auto h-full w-full max-w-[430px] overflow-hidden bg-white">
       {/* Map */}
-      <Map onMapReady={setMapInstance}>
+      <MapView onMapReady={setMapInstance}>
         {(map) => (
           <>
             {/* Route trail lines */}
@@ -615,7 +632,7 @@ export function ShuttleSelectionScreen() {
             ))}
           </>
         )}
-      </Map>
+      </MapView>
 
       {/* Back button */}
       <button

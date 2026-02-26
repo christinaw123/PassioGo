@@ -259,10 +259,38 @@ def api_next_departures():
             cutoff = now_unix - DWELL_GRACE_S if is_vehicle_trip else now_unix
             if dep_unix > cutoff:
                 dep_display = _dt.fromtimestamp(dep_unix).strftime("%-I:%M %p")
+                # Find the preceding trip in the same block — that vehicle will run this trip next.
+                prev_block_trip_id = None
+                block_id = gtfs.block_id_by_trip_id.get(trip_id)
+                if block_id:
+                    block_trips = gtfs.trips_by_block_id.get(block_id, [])
+                    # Get first departure time of each trip in the block to establish order.
+                    trip_starts: list[tuple[str, int]] = []
+                    for bt in block_trips:
+                        bt_id = bt.get("trip_id")
+                        if not bt_id:
+                            continue
+                        bt_sts = gtfs.stop_times_by_trip_id.get(bt_id, [])
+                        if not bt_sts:
+                            continue
+                        first = min(
+                            (s.get("departure_time") or s.get("arrival_time", "") for s in bt_sts),
+                            default="",
+                        )
+                        if first:
+                            try:
+                                trip_starts.append((bt_id, gtfs.gtfs_time_to_today_unix(first)))
+                            except ValueError:
+                                pass
+                    trip_starts.sort(key=lambda x: x[1])
+                    idx = next((i for i, (tid, _) in enumerate(trip_starts) if tid == trip_id), None)
+                    if idx is not None and idx > 0:
+                        prev_block_trip_id = trip_starts[idx - 1][0]
                 departures.append({
                     "trip_id": trip_id,
                     "departure_unix": dep_unix,
                     "departure_display": dep_display,
+                    "prev_block_trip_id": prev_block_trip_id,
                 })
             break  # only one stop_time entry per stop per trip
 

@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useNavigate, useLocation } from "react-router";
-import { Map } from "../Map";
+import { Map as MapView } from "../Map";
 import { StopMarker } from "../StopMarker";
 import { VehicleMarker } from "../VehicleMarker";
 import { RouteTrail } from "../RouteTrail";
@@ -10,9 +10,7 @@ import { motion, AnimatePresence } from "motion/react";
 import mapboxgl from "mapbox-gl";
 import {
   nearestPointOnLine,
-  nearestPointOnLineInRange,
   clipLineSegment,
-  lineLength,
   haversineDistance,
   buildPrecomputedRoute,
   type PrecomputedRoute,
@@ -33,11 +31,12 @@ interface NextDeparture {
   trip_id: string;
   departure_unix: number;
   departure_display: string;
+  prev_block_trip_id: string | null;
 }
 
 type BusState =
   | { type: "arriving"; etaMinutes: number; vehicle: Vehicle; trail: [number, number][] }
-  | { type: "dwelling"; vehicle: Vehicle; leavingInMinutes: number | null }
+  | { type: "dwelling"; vehicle: Vehicle; scheduledDepUnix: number | null }
   | { type: "departed"; vehicle: Vehicle | null; nextDepartures: NextDeparture[] }
   | { type: "no-data"; nextDepartures: NextDeparture[] };
 
@@ -64,167 +63,99 @@ const MISSED_BTN_RADIUS = 16;          // try: 8   12  16  20  24
 const MISSED_BTN_PADDING_Y = 16;       // try: 10  12  14  16
 // ─────────────────────────────────────────────────────────────────────────────
 
-const AVG_SPEED_MPS = 5.4;
 /** Tight haversine fallback for dwell (when no stop_id available). 50 m keeps
  *  "at stop now" from firing for a bus parked on the other side of a building. */
 const DWELL_DISTANCE_M = 50;
-const BLEND_MIN_SPEED_MPS = 1.0;
 /** Show vehicle icon up to this many meters past origin before hiding it */
 const DEPARTED_SHOW_DISTANCE_M = 500;
-/** Ignore vehicles whose GPS is more than this far from the route shape — filters
- *  deadheading buses or stale trip_ids broadcasting from a different route */
-const MAX_OFF_ROUTE_M = 500;
+
+/** Best-effort trail from vehicle to origin along the route shape, for map display only.
+ *  Returns [] if the trail can't be built (arriving state is unaffected). */
+function computeApproachTrail(
+  vehicle: Vehicle,
+  originStop: { id: string; lat: number; lon: number },
+  routeCoords: [number, number][],
+  precomputed?: PrecomputedRoute
+): [number, number][] {
+  if (routeCoords.length < 2) return [];
+  try {
+    const isLoop: boolean = precomputed?.isLoop ??
+      (routeCoords.length >= 10 &&
+        haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100);
+    const originProj =
+      precomputed?.stopProjs && (precomputed?.originIdx ?? -1) >= 0
+        ? precomputed.stopProjs[precomputed.originIdx]
+        : nearestPointOnLine(routeCoords, [originStop.lon, originStop.lat]);
+    const vProj = nearestPointOnLine(routeCoords, [vehicle.lon, vehicle.lat]);
+    if (
+      vProj.segIndex < originProj.segIndex ||
+      (vProj.segIndex === originProj.segIndex && vProj.t <= originProj.t)
+    ) {
+      const trail = clipLineSegment(routeCoords, vProj.segIndex, vProj.projPoint, originProj.segIndex, originProj.projPoint);
+      return trail.length >= 2 ? trail : [];
+    } else if (isLoop) {
+      const toEnd = clipLineSegment(routeCoords, vProj.segIndex, vProj.projPoint, routeCoords.length - 2, routeCoords[routeCoords.length - 1]);
+      const fromStart = clipLineSegment(routeCoords, 0, routeCoords[0], originProj.segIndex, originProj.projPoint);
+      const stitched = [...toEnd, ...fromStart];
+      return stitched.length >= 2 ? stitched : [];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
 
 function detectBusState(
   vehicles: Vehicle[],
   originStop: { id: string; lat: number; lon: number },
+  feedEtas: { trip_id: string | null; arrival_time: number | null }[],
   routeCoords: [number, number][],
   precomputed?: PrecomputedRoute
 ): BusState {
-  if (vehicles.length === 0) return { type: "no-data", nextDepartures: [] };
-
   const originLngLat: [number, number] = [originStop.lon, originStop.lat];
 
-  // Dwell check.
-  // Primary signal: vehicle's GTFS-RT stop_id matches this stop AND is physically close.
-  // This is more reliable than haversine alone since stop_id is set by the vehicle's own
-  // onboard system. Fallback: tight haversine (50 m) when stop_id is unavailable.
+  // Dwell check: vehicle is physically at the stop.
   for (const v of vehicles) {
     const dist = haversineDistance([v.lon, v.lat], originLngLat);
     const isDwelling =
       (v.stop_id != null && v.stop_id === originStop.id && dist <= 100) ||
       dist <= DWELL_DISTANCE_M;
-    if (isDwelling) return { type: "dwelling", vehicle: v, leavingInMinutes: null };
+    if (isDwelling) return { type: "dwelling", vehicle: v, scheduledDepUnix: null };
   }
 
-  if (routeCoords.length < 2) return { type: "departed", vehicle: null, nextDepartures: [] };
-
-  // Use precomputed projections if available (computed once when route loads, not per-poll).
-  // Fall back to inline computation if not provided.
-  type StopProj = { segIndex: number; projPoint: [number, number]; t: number };
-  let stopProjs: StopProj[] | null = precomputed?.stopProjs ?? null;
-  let originIdx: number = precomputed?.originIdx ?? -1;
-  const isLoop: boolean = precomputed?.isLoop ??
-    (routeCoords.length >= 10 &&
-      haversineDistance(routeCoords[0], routeCoords[routeCoords.length - 1]) < 100);
-
-  // Origin projection — use stop-based if available (avoids wrong loop snap)
-  const originProj: StopProj =
-    stopProjs && originIdx >= 0
-      ? stopProjs[originIdx]
-      : nearestPointOnLine(routeCoords, originLngLat);
-
-  // Project a vehicle onto the shape, constrained to its nearest stop's bracket.
-  // stopPositions (parallel to stopProjs) are used for the haversine nearest-stop lookup.
-  // This prevents nearestPointOnLine from snapping to the wrong iteration on loop routes.
-  const stopPositions = precomputed?.stopPositions ?? null;
-  const projectVehicle = (
-    v: Vehicle
-  ): { vProj: ReturnType<typeof nearestPointOnLine>; nearestStopIdx: number } => {
-    if (stopProjs && stopPositions) {
-      let nearestStopIdx = 0;
-      let nearestDist = Infinity;
-      for (let i = 0; i < stopPositions.length; i++) {
-        const d = haversineDistance([v.lon, v.lat], stopPositions[i]);
-        if (d < nearestDist) { nearestDist = d; nearestStopIdx = i; }
-      }
-      const lo = stopProjs[Math.max(0, nearestStopIdx - 1)].segIndex;
-      const hi = stopProjs[Math.min(stopProjs.length - 1, nearestStopIdx + 1)].segIndex;
-      return { vProj: nearestPointOnLineInRange(routeCoords, [v.lon, v.lat], lo, hi), nearestStopIdx };
-    }
-    return { vProj: nearestPointOnLine(routeCoords, [v.lon, v.lat]), nearestStopIdx: -1 };
-  };
-
+  // Use PassioGo's trip updates feed to find the soonest arriving vehicle.
+  // Match each ETA entry to a visible vehicle by trip_id.
+  const vehicleByTripId = new Map(vehicles.map(v => [v.trip_id, v]));
+  const now = Date.now() / 1000;
   let bestEta = Infinity;
   let bestVehicle: Vehicle | null = null;
   let bestTrail: [number, number][] = [];
-  let closestPastVehicle: Vehicle | null = null;
-  let closestPastDist = Infinity;
 
-  for (const v of vehicles) {
-    const { vProj, nearestStopIdx } = projectVehicle(v);
-    if (vProj.dist > MAX_OFF_ROUTE_M) continue;
-
-    // Determine approaching vs past using stop-sequence order (handles loops correctly).
-    // For loops, use circular modular distance: if the vehicle is within half the loop
-    // behind origin in stop order, it is approaching.
-    let isApproaching: boolean;
-    if (stopProjs && stopPositions && originIdx >= 0 && nearestStopIdx >= 0) {
-      const N = stopPositions.length;
-      const forwardStopDist = isLoop
-        ? (originIdx - nearestStopIdx + N) % N
-        : originIdx - nearestStopIdx;
-      isApproaching = forwardStopDist > 0 && (isLoop ? forwardStopDist <= N / 2 : true);
-    } else {
-      isApproaching = !(
-        vProj.segIndex > originProj.segIndex ||
-        (vProj.segIndex === originProj.segIndex && vProj.t > originProj.t)
-      );
-    }
-
-    if (isApproaching) {
-      // Build trail from vehicle to origin along the shape.
-      // For loop routes, if the vehicle is near the end of the shape and origin is near the
-      // start, stitch two segments together across the loop boundary.
-      let trail: [number, number][];
-      if (
-        vProj.segIndex < originProj.segIndex ||
-        (vProj.segIndex === originProj.segIndex && vProj.t <= originProj.t)
-      ) {
-        // Normal case: vehicle appears before origin in shape order
-        trail = clipLineSegment(
-          routeCoords,
-          vProj.segIndex,
-          vProj.projPoint,
-          originProj.segIndex,
-          originProj.projPoint
-        );
-      } else if (isLoop) {
-        // Loop wrap-around: vehicle is near end of shape, origin near start.
-        // Stitch: vehicle→shape_end + shape_start→origin
-        const toEnd = clipLineSegment(
-          routeCoords,
-          vProj.segIndex,
-          vProj.projPoint,
-          routeCoords.length - 2,
-          routeCoords[routeCoords.length - 1]
-        );
-        const fromStart = clipLineSegment(
-          routeCoords,
-          0,
-          routeCoords[0],
-          originProj.segIndex,
-          originProj.projPoint
-        );
-        trail = [...toEnd, ...fromStart];
-      } else {
-        trail = [];
-      }
-
-      if (trail.length < 2) continue;
-
-      const dist = lineLength(trail);
-      const speed = (v.speed ?? 0) > BLEND_MIN_SPEED_MPS ? v.speed! : AVG_SPEED_MPS;
-      const eta = Math.max(1, Math.round(dist / speed / 60));
-
-      if (eta < bestEta) {
-        bestEta = eta;
-        bestVehicle = v;
-        bestTrail = trail;
-      }
-    } else {
-      const dist = haversineDistance([v.lon, v.lat], originLngLat);
-      if (dist < closestPastDist) {
-        closestPastDist = dist;
-        closestPastVehicle = v;
-      }
+  for (const e of feedEtas) {
+    if (!e.trip_id || e.arrival_time == null || e.arrival_time <= now) continue;
+    const vehicle = vehicleByTripId.get(e.trip_id);
+    if (!vehicle) continue;
+    const etaMin = Math.max(1, Math.round((e.arrival_time - now) / 60));
+    if (etaMin < bestEta) {
+      bestEta = etaMin;
+      bestVehicle = vehicle;
+      bestTrail = computeApproachTrail(vehicle, originStop, routeCoords, precomputed);
     }
   }
 
   if (bestVehicle) {
     return { type: "arriving", etaMinutes: bestEta, vehicle: bestVehicle, trail: bestTrail };
   }
-  return { type: "departed", vehicle: closestPastVehicle, nextDepartures: [] };
+
+  // No feed ETA matched a visible vehicle — shuttle departed or feed not yet publishing.
+  const closestVehicle = vehicles.reduce<Vehicle | null>((best, v) => {
+    if (!best) return v;
+    return haversineDistance([v.lon, v.lat], originLngLat) <
+      haversineDistance([best.lon, best.lat], originLngLat) ? v : best;
+  }, null);
+
+  if (vehicles.length === 0) return { type: "no-data", nextDepartures: [] };
+  return { type: "departed", vehicle: closestVehicle, nextDepartures: [] };
 }
 
 export function TrackingPreBoardScreen() {
@@ -239,6 +170,7 @@ export function TrackingPreBoardScreen() {
   const shuttle = stateData.shuttle || { name: "", color: "#1E90FF", route_id: "" };
 
   const [busState, setBusState] = useState<BusState | null>(null);
+  const [allVehicles, setAllVehicles] = useState<Vehicle[]>([]);
   const [routeCoords, setRouteCoords] = useState<[number, number][]>([]);
   const [routeStops, setRouteStops] = useState<{ lat: number; lon: number }[]>([]);
   const [originStop, setOriginStop] = useState<{ id: string; lat: number; lon: number } | null>(null);
@@ -326,6 +258,7 @@ export function TrackingPreBoardScreen() {
         if (dStop) setDestStop({ id: dStop.id, lat: dStop.lat, lon: dStop.lon });
 
         const vehicles: Vehicle[] = vehiclesData.vehicles || [];
+        setAllVehicles(vehicles);
 
         let state: BusState;
         if (oStop) {
@@ -336,16 +269,36 @@ export function TrackingPreBoardScreen() {
             stops.map((s: { lat: number; lon: number }) => ({ lat: s.lat, lon: s.lon })),
             [oStop.lon, oStop.lat]
           );
-          const raw = detectBusState(vehicles, oStop, coords, initPrecomputed ?? undefined);
+
+          // Fetch PassioGo's predicted arrival times for the origin stop.
+          let feedEtas: { trip_id: string | null; arrival_time: number | null }[] = [];
+          try {
+            const etaRes = await fetch(
+              `/api/eta?stop_id=${encodeURIComponent(oStop.id)}`,
+              { signal }
+            );
+            if (etaRes.ok) {
+              const etaData = await etaRes.json();
+              feedEtas = etaData.etas || [];
+            }
+          } catch { /* no feed ETAs — schedule fallback will be used */ }
+
+          const raw = detectBusState(vehicles, oStop, feedEtas, coords, initPrecomputed ?? undefined);
           if (raw.type === "dwelling") {
             const depUnix = await fetchScheduledDeparture(raw.vehicle.trip_id, oStop.id);
-            const leavingIn = depUnix != null
-              ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
-              : null;
-            state = { type: "dwelling", vehicle: raw.vehicle, leavingInMinutes: leavingIn };
+            state = { type: "dwelling", vehicle: raw.vehicle, scheduledDepUnix: depUnix };
           } else if (raw.type === "departed" || raw.type === "no-data") {
             const nextDeps = await fetchNextDepartures(shuttle.route_id, oStop.id);
-            state = { ...raw, nextDepartures: nextDeps } as BusState;
+            // Match the vehicle that will run the next scheduled trip.
+            // Primary: match the preceding block trip (vehicle is currently running it).
+            // Fallback: match the scheduled trip_id directly (vehicle already switched).
+            const nextTripVehicle = nextDeps.length > 0
+              ? (vehicles.find(v => v.trip_id === nextDeps[0].prev_block_trip_id)
+                  ?? vehicles.find(v => v.trip_id === nextDeps[0].trip_id)
+                  ?? null)
+              : null;
+            console.log('[TrackingPreBoard] next dep:', nextDeps[0]?.trip_id, 'prev_block:', nextDeps[0]?.prev_block_trip_id, 'live trip_ids:', vehicles.map(v => v.trip_id), 'matched:', !!nextTripVehicle);
+            state = { ...raw, nextDepartures: nextDeps, vehicle: nextTripVehicle } as BusState;
           } else {
             state = raw;
           }
@@ -398,32 +351,46 @@ export function TrackingPreBoardScreen() {
   const originStopRef = useRef(originStop);
   originStopRef.current = originStop;
 
-  // Poll every 5s — pure position-based, no /api/eta
+  // Poll every 5s — fetches vehicle positions + feed ETAs in parallel
   useEffect(() => {
     if (!busState || !originStop) return;
 
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(`/api/vehicles?route=${encodeURIComponent(shuttle.name)}`);
-        if (!res.ok) return;
-        const data = await res.json();
-        const vehicles: Vehicle[] = data.vehicles || [];
-        const coords = routeCoordsRef.current;
         const oStop = originStopRef.current;
         if (!oStop) return;
 
-        const raw = detectBusState(vehicles, oStop, coords, precomputedRef.current ?? undefined);
+        // Fetch vehicle positions and feed ETAs in parallel.
+        const [vRes, etaRes] = await Promise.all([
+          fetch(`/api/vehicles?route=${encodeURIComponent(shuttle.name)}`),
+          fetch(`/api/eta?stop_id=${encodeURIComponent(oStop.id)}`),
+        ]);
+        if (!vRes.ok) return;
+        const data = await vRes.json();
+        const vehicles: Vehicle[] = data.vehicles || [];
+        setAllVehicles(vehicles);
+        const coords = routeCoordsRef.current;
+
+        let feedEtas: { trip_id: string | null; arrival_time: number | null }[] = [];
+        if (etaRes.ok) {
+          const etaData = await etaRes.json();
+          feedEtas = etaData.etas || [];
+        }
+
+        const raw = detectBusState(vehicles, oStop, feedEtas, coords, precomputedRef.current ?? undefined);
         let state: BusState;
 
         if (raw.type === "dwelling") {
           const depUnix = await fetchScheduledDeparture(raw.vehicle.trip_id, oStop.id);
-          const leavingIn = depUnix != null
-            ? Math.max(0, Math.round((depUnix - Date.now() / 1000) / 60))
-            : null;
-          state = { type: "dwelling", vehicle: raw.vehicle, leavingInMinutes: leavingIn };
+          state = { type: "dwelling", vehicle: raw.vehicle, scheduledDepUnix: depUnix };
         } else if (raw.type === "departed" || raw.type === "no-data") {
           const nextDeps = await fetchNextDepartures(shuttle.route_id, oStop.id);
-          state = { ...raw, nextDepartures: nextDeps } as BusState;
+          const nextTripVehicle = nextDeps.length > 0
+            ? (vehicles.find(v => v.trip_id === nextDeps[0].prev_block_trip_id)
+                ?? vehicles.find(v => v.trip_id === nextDeps[0].trip_id)
+                ?? null)
+            : null;
+          state = { ...raw, nextDepartures: nextDeps, vehicle: nextTripVehicle } as BusState;
         } else {
           state = raw;
         }
@@ -435,29 +402,39 @@ export function TrackingPreBoardScreen() {
     return () => clearInterval(interval);
   }, [!!busState, !!originStop, shuttle.name, shuttle.route_id]);
 
-  // Derive trail from busState
+  // Derive trail and vehicles to display on the map.
+  // - arriving: approach trail + specific vehicle from feed match
+  // - dwelling: specific vehicle, no trail
+  // - departed, specific vehicle identified (block_id match): approach trail + that vehicle
+  // - departed, no specific match but next departure exists: full route shape + ALL live vehicles
   const trail = useMemo(() => {
     if (busState?.type === "arriving") return busState.trail;
+    if (busState?.type === "departed" && busState.vehicle && originStop && routeCoords.length >= 2) {
+      return computeApproachTrail(busState.vehicle, originStop, routeCoords, precomputedRoute ?? undefined);
+    }
+    // Can't identify specific vehicle — show full route shape so user sees where the route goes
+    if ((busState?.type === "departed" || busState?.type === "no-data")
+        && !busState.vehicle
+        && busState.nextDepartures.length > 0
+        && routeCoords.length >= 2) {
+      return routeCoords;
+    }
     return null;
-  }, [busState]);
+  }, [busState, originStop, routeCoords, precomputedRoute]);
 
-  // Determine whether to show the vehicle on the map when departed
-  const showDepartedVehicle = useMemo(() => {
-    if (busState?.type !== "departed" || !busState.vehicle || !originStop) return false;
-    const dist = haversineDistance(
-      [busState.vehicle.lon, busState.vehicle.lat],
-      [originStop.lon, originStop.lat]
-    );
-    return dist <= DEPARTED_SHOW_DISTANCE_M;
-  }, [busState, originStop]);
-
-  const activeVehicle = useMemo(() => {
-    if (!busState) return null;
-    if (busState.type === "arriving") return busState.vehicle;
-    if (busState.type === "dwelling") return busState.vehicle;
-    if (busState.type === "departed" && showDepartedVehicle) return busState.vehicle;
-    return null;
-  }, [busState, showDepartedVehicle]);
+  // Which vehicles to render. Array so we can show all of them when the specific one is unknown.
+  const displayVehicles = useMemo(() => {
+    if (!busState) return [];
+    if (busState.type === "arriving") return [busState.vehicle];
+    if (busState.type === "dwelling") return [busState.vehicle];
+    if (busState.type === "departed") {
+      if (busState.vehicle) return [busState.vehicle];
+      // Block-id match failed — show every live vehicle on the route so the user
+      // can see where all shuttles currently are.
+      if (busState.nextDepartures.length > 0) return allVehicles;
+    }
+    return [];
+  }, [busState, allVehicles]);
 
   if (loading) {
     return (
@@ -467,12 +444,14 @@ export function TrackingPreBoardScreen() {
     );
   }
 
-  const isDeparted = busState?.type === "departed";
+  // Only show the "has left" toast when there's genuinely no upcoming departure.
+  // If a next scheduled departure exists, we're tracking that trip — no toast needed.
+  const isDeparted = busState?.type === "departed" && busState.nextDepartures.length === 0;
 
   return (
     <div className="relative mx-auto h-full w-full max-w-[430px] overflow-hidden bg-white">
       {/* Map */}
-      <Map onMapReady={setMapInstance}>
+      <MapView onMapReady={setMapInstance}>
         {(map) => (
           <>
             {/* Trail line */}
@@ -508,20 +487,21 @@ export function TrackingPreBoardScreen() {
               />
             )}
 
-            {/* Vehicle marker */}
-            {activeVehicle && (
+            {/* Vehicle markers */}
+            {displayVehicles.map((v) => (
               <VehicleMarker
+                key={v.id}
                 map={map}
-                lng={activeVehicle.lon}
-                lat={activeVehicle.lat}
+                lng={v.lon}
+                lat={v.lat}
                 color={shuttle.color}
-                bearing={activeVehicle.bearing}
+                bearing={v.bearing}
                 pulsing={busState?.type === "dwelling"}
               />
-            )}
+            ))}
           </>
         )}
-      </Map>
+      </MapView>
 
       {/* Back button */}
       <button
@@ -599,35 +579,50 @@ export function TrackingPreBoardScreen() {
             </motion.div>
           )}
 
-          {busState?.type === "dwelling" && (
-            <motion.div
-              initial={{ scale: 0.95 }}
-              animate={{ scale: 1 }}
-              transition={{ repeat: Infinity, repeatType: "reverse", duration: 1.5 }}
-              className="text-center"
-              style={{ backgroundColor: `${shuttle.color}15`, borderRadius: STATUS_CARD_RADIUS, padding: STATUS_CARD_PADDING, marginBottom: STATUS_CARD_MARGIN }}
-            >
-              <div className="mb-1 text-3xl">🚌</div>
-              <div className="text-lg font-medium" style={{ color: shuttle.color }}>
-                {busState.leavingInMinutes === 0 ? "Departing now" : "At your stop now"}
-              </div>
-              {busState.leavingInMinutes != null && busState.leavingInMinutes > 0 && busState.leavingInMinutes <= 20 && (
-                <div className="mt-0.5 text-sm font-medium" style={{ color: shuttle.color }}>
-                  Leaving in ~{busState.leavingInMinutes} min
+          {busState?.type === "dwelling" && (() => {
+            const now = Date.now() / 1000;
+            const depUnix = busState.scheduledDepUnix;
+            const isDeparting = depUnix != null && depUnix <= now;
+            const minsUntilDep = depUnix != null ? Math.round((depUnix - now) / 60) : null;
+            return (
+              <motion.div
+                initial={{ scale: 0.95 }}
+                animate={{ scale: 1 }}
+                transition={{ repeat: Infinity, repeatType: "reverse", duration: 1.5 }}
+                className="text-center"
+                style={{ backgroundColor: `${shuttle.color}15`, borderRadius: STATUS_CARD_RADIUS, padding: STATUS_CARD_PADDING, marginBottom: STATUS_CARD_MARGIN }}
+              >
+                <div className="mb-1 text-3xl">🚌</div>
+                <div className="text-lg font-medium" style={{ color: shuttle.color }}>
+                  {isDeparting ? "Departing now" : "Shuttle is here"}
                 </div>
-              )}
-              <div className="mt-1 text-sm text-gray-600">At {origin}</div>
-            </motion.div>
-          )}
+                {!isDeparting && depUnix != null && (
+                  <div className="mt-0.5 text-sm font-medium" style={{ color: shuttle.color }}>
+                    {minsUntilDep != null && minsUntilDep > 0
+                      ? `Scheduled to depart in ${minsUntilDep} min`
+                      : "Departing any moment"}
+                  </div>
+                )}
+                <div className="mt-1 text-sm text-gray-600">At {origin}</div>
+              </motion.div>
+            );
+          })()}
 
           {(busState?.type === "departed" || busState?.type === "no-data") && (
             <div className="bg-gray-50 text-center" style={{ borderRadius: STATUS_CARD_RADIUS, padding: STATUS_CARD_PADDING, marginBottom: STATUS_CARD_MARGIN }}>
               <div className="mb-1 text-3xl">🕐</div>
-              <div className="text-lg font-medium text-gray-700">
-                {busState.nextDepartures.length > 0
-                  ? `Next at ${busState.nextDepartures[0].departure_display}`
-                  : "No upcoming departures"}
-              </div>
+              {busState.nextDepartures.length > 0 ? (
+                <>
+                  <div className="text-lg font-medium text-gray-700">
+                    Scheduled in {Math.max(1, Math.round((busState.nextDepartures[0].departure_unix - Date.now() / 1000) / 60))} min
+                  </div>
+                  <div className="mt-0.5 text-sm text-gray-500">
+                    Next scheduled at {busState.nextDepartures[0].departure_display}
+                  </div>
+                </>
+              ) : (
+                <div className="text-lg font-medium text-gray-700">No upcoming departures</div>
+              )}
               <div className="mt-1 text-sm text-gray-600">At {origin}</div>
             </div>
           )}

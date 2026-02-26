@@ -16,6 +16,8 @@ shape_points_by_shape_id: Dict[str, List[Dict[str, str]]] = {}
 stop_times_by_trip_id: Dict[str, List[Dict[str, str]]] = {}
 calendar_by_service_id: Dict[str, Dict] = {}       # service_id → calendar row
 calendar_exceptions: Dict[str, List[Dict]] = {}    # service_id → [{date, exception_type}]
+block_id_by_trip_id: Dict[str, str] = {}           # trip_id → block_id
+trips_by_block_id: Dict[str, List[Dict[str, str]]] = {}  # block_id → [trip_row, ...]
 
 
 def read_gtfs_csv(filename: str) -> List[Dict[str, str]]:
@@ -91,7 +93,8 @@ def gtfs_time_to_today_unix(gtfs_time_str: str) -> int:
 def build_static_gtfs_indices() -> None:
     global route_lookup_by_name, trips_grouped_by_route_id, route_id_by_trip_id, \
         stop_row_by_stop_id, shape_points_by_shape_id, stop_times_by_trip_id, \
-        calendar_by_service_id, calendar_exceptions
+        calendar_by_service_id, calendar_exceptions, \
+        block_id_by_trip_id, trips_by_block_id
 
     routes_rows = read_gtfs_csv("routes.txt")
     stops_rows = read_gtfs_csv("stops.txt")
@@ -110,6 +113,8 @@ def build_static_gtfs_indices() -> None:
     # trips lookup
     trips_grouped_by_route_id = {}
     route_id_by_trip_id = {}
+    block_id_by_trip_id = {}
+    trips_by_block_id = {}
     for trip_row in trips_rows:
         trip_id = trip_row.get("trip_id")
         route_id = trip_row.get("route_id")
@@ -117,6 +122,10 @@ def build_static_gtfs_indices() -> None:
             continue
         route_id_by_trip_id[trip_id] = route_id
         trips_grouped_by_route_id.setdefault(route_id, []).append(trip_row)
+        block_id = trip_row.get("block_id")
+        if block_id:
+            block_id_by_trip_id[trip_id] = block_id
+            trips_by_block_id.setdefault(block_id, []).append(trip_row)
 
     # stops lookup
     stop_row_by_stop_id = {row["stop_id"]: row for row in stops_rows if row.get("stop_id")}
